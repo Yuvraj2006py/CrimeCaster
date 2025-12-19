@@ -1,0 +1,36 @@
+# Dockerfile for ML training jobs
+FROM python:3.11-slim
+
+# Install system dependencies for ML libraries and PostGIS
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    libpq-dev \
+    libgdal-dev \
+    gdal-bin \
+    libgeos-dev \
+    libproj-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy requirements and install
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir .
+
+# Copy training and related code
+COPY training/ ./training/
+COPY feature_engineering/ ./feature_engineering/
+COPY sql/ ./sql/
+
+# Create models directory
+RUN mkdir -p models && chmod 777 models
+
+# Create non-root user
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# Default entrypoint (can be overridden)
+ENTRYPOINT ["python", "-m", "training.trainer"]
+

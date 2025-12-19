@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crime-caster-toronto"
+version = "0.1.0"
+description = "End-to-end batch data pipeline and ML forecasting system for Toronto crime data"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Crime Caster Team"}
+]
+keywords = ["crime", "forecasting", "machine-learning", "data-pipeline", "toronto"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+]
+
+dependencies = [
+    # Core data processing
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "sqlalchemy>=2.0.0",
+    "psycopg2-binary>=2.9.0",
+    
+    # Spatial processing
+    "h3>=3.7.0",
+    "geopandas>=0.13.0",
+    "shapely>=2.0.0",
+    
+    # Machine Learning
+    "scikit-learn>=1.3.0",
+    "xgboost>=2.0.0",
+    "lightgbm>=4.0.0",
+    "shap>=0.42.0",
+    "joblib>=1.3.0",
+    
+    # API
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    
+    # Utilities
+    "python-dotenv>=1.0.0",
+    "loguru>=0.7.0",
+    "httpx>=0.25.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.7.0",
+    "jupyter>=1.0.0",
+    "ipykernel>=6.26.0",
+]
+
+[project.scripts]
+ingest = "ingestion.bronze.csv_loader:main"
+train = "training.trainer:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ingestion*", "validation*", "transformations*", "feature_engineering*", "training*", "inference*", "api*"]
+
+[tool.black]
+line-length = 100
+target-version = ['py311']
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+

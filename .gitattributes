@@ -1,0 +1,6 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Exclude .env from version control
+.env filter=git-crypt diff=git-crypt
+
