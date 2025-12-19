@@ -5,7 +5,7 @@ WORKDIR /app
 
 # Copy package files
 COPY frontend/package*.json ./
-RUN npm ci
+RUN npm install
 
 # Copy frontend source
 COPY frontend/ ./
@@ -25,9 +25,14 @@ RUN addgroup --system --gid 1001 nodejs && \
     adduser --system --uid 1001 nextjs
 
 # Copy built application
-COPY --from=builder /app/public ./public
-COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+# Next.js standalone output: server.js is directly in .next/standalone/
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone/server.js ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone/package.json ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone/node_modules ./node_modules/
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone/.next ./.next/
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone/pages ./pages/
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+RUN mkdir -p ./public
 
 USER nextjs
 
@@ -36,5 +41,6 @@ EXPOSE 3000
 ENV PORT=3000
 ENV HOSTNAME="0.0.0.0"
 
+# Use the server.js from standalone directory
 CMD ["node", "server.js"]
 

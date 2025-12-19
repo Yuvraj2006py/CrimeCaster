@@ -42,10 +42,11 @@ services:
     environment:
       - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
       - NEXT_PUBLIC_MAPBOX_ACCESS_TOKEN=${MAPBOX_ACCESS_TOKEN}
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
-      - /app/.next
+    # Volumes commented out for production build - uncomment for development
+    # volumes:
+    #   - ./frontend:/app
+    #   - /app/node_modules
+    #   - /app/.next
     env_file:
       - .env
     depends_on:

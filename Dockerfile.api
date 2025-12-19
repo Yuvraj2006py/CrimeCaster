@@ -26,9 +26,9 @@ FROM python:3.11-slim
 # Install runtime dependencies for PostGIS
 RUN apt-get update && apt-get install -y \
     libpq5 \
-    libgdal32 \
-    libgeos3.11.1 \
-    libproj25 \
+    libgdal-dev \
+    libgeos-dev \
+    libproj-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -42,6 +42,7 @@ COPY api/ ./api/
 COPY inference/ ./inference/
 COPY feature_engineering/ ./feature_engineering/
 COPY training/ ./training/
+COPY sql/ ./sql/
 
 # Create non-root user
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
