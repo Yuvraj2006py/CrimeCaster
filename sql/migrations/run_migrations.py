@@ -17,59 +17,37 @@ load_dotenv()
 
 def get_database_url():
     """Get database URL from environment variables."""
-    # Prefer direct connection for migrations
+    # Prefer DATABASE_URL from environment
     database_url = os.getenv("DATABASE_URL")
     
-    # If DATABASE_URL is not set, construct it from individual Supabase variables
+    # If DATABASE_URL is not set, construct it from individual DB variables
     if not database_url:
-        host = os.getenv("SUPABASE_DB_HOST")
-        port = os.getenv("SUPABASE_DB_PORT", "5432")
-        db_name = os.getenv("SUPABASE_DB_NAME", "postgres")
-        password = os.getenv("SUPABASE_DB_PASSWORD")
+        host = os.getenv("DB_HOST")
+        port = os.getenv("DB_PORT", "5432")
+        db_name = os.getenv("DB_NAME", "postgres")
+        db_user = os.getenv("DB_USER", "postgres")
+        password = os.getenv("DB_PASSWORD")
         
         if not host:
-            raise ValueError("SUPABASE_DB_HOST not found in environment variables")
+            raise ValueError("DB_HOST not found in environment variables. Set DATABASE_URL or DB_HOST/DB_PASSWORD")
         
         if not password:
-            raise ValueError("SUPABASE_DB_PASSWORD not found in environment variables")
+            raise ValueError("DB_PASSWORD not found in environment variables. Set DATABASE_URL or DB_HOST/DB_PASSWORD")
         
         # Check for placeholder password
-        if "your-database-password" in password or "your-" in password.lower():
+        if "your-database-password" in password or "[YOUR-PASSWORD]" in password or "your-" in password.lower():
             raise ValueError(
-                "Please update SUPABASE_DB_PASSWORD in your .env file with your actual database password.\n"
-                "Get it from: https://supabase.com/dashboard/project/hibjmylxyfhcizjtmspi/settings/database"
+                "Please update DB_PASSWORD in your .env file with your actual database password.\n"
+                "Get it from your database provider's dashboard (Neon, Railway, etc.)"
             )
         
-        database_url = f"postgresql://postgres:{password}@{host}:{port}/{db_name}"
-    
-    # If DATABASE_URL uses connection pooling, use direct connection instead
-    elif database_url and "pgbouncer=true" in database_url:
-        # Extract components and rebuild with direct port
-        host = os.getenv("SUPABASE_DB_HOST")
-        port = os.getenv("SUPABASE_DB_PORT", "5432")
-        db_name = os.getenv("SUPABASE_DB_NAME", "postgres")
-        password = os.getenv("SUPABASE_DB_PASSWORD")
-        
-        # Check for placeholder password
-        if password and ("your-database-password" in password or "your-" in password.lower()):
-            raise ValueError(
-                "Please update SUPABASE_DB_PASSWORD in your .env file with your actual database password.\n"
-                "Get it from: https://supabase.com/dashboard/project/hibjmylxyfhcizjtmspi/settings/database"
-            )
-        
-        if not host:
-            raise ValueError("SUPABASE_DB_HOST not found in environment variables")
-        
-        if not password:
-            raise ValueError("SUPABASE_DB_PASSWORD not found in environment variables")
-        
-        database_url = f"postgresql://postgres:{password}@{host}:{port}/{db_name}"
+        database_url = f"postgresql://{db_user}:{password}@{host}:{port}/{db_name}"
     
     # Validate password is not placeholder
-    if "your-database-password" in database_url or "your-" in database_url.lower():
+    if database_url and ("your-database-password" in database_url or "[YOUR-PASSWORD]" in database_url or "your-" in database_url.lower()):
         raise ValueError(
             "Please update your database password in .env file.\n"
-            "Get it from Supabase Dashboard → Settings → Database"
+            "Get it from your database provider's dashboard (Neon, Railway, etc.)"
         )
     
     return database_url
@@ -149,4 +127,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Migration failed: {e}")
         sys.exit(1)
-

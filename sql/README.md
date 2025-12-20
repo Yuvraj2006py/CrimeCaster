@@ -13,9 +13,14 @@ This directory contains the database schema and migration files for Crime Caster
 
 ### Option 1: Run schema.sql directly (Recommended for initial setup)
 
-1. Go to your Supabase project SQL Editor
+1. Go to your database provider's SQL Editor (Neon, Railway, etc.)
 2. Copy and paste the contents of `schema.sql`
 3. Click "Run" to execute
+
+**Note**: Make sure PostGIS extension is enabled first:
+```sql
+CREATE EXTENSION IF NOT EXISTS postgis;
+```
 
 ### Option 2: Use migration runner
 

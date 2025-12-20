@@ -47,14 +47,19 @@ git clone <repository-url>
 cd CrimeCaster
 ```
 
-### 2. Set Up Supabase
+### 2. Set Up Database
 
-1. Create a project at [supabase.com](https://supabase.com)
-2. Go to Project Settings → Database
-3. Copy your database connection details
-4. Enable PostGIS extension:
-   - Go to SQL Editor in Supabase dashboard
+**Recommended: Neon (Free, No Pausing)**
+
+1. Create a project at [neon.tech](https://neon.tech) (free)
+2. Enable PostGIS extension:
+   - Go to SQL Editor in Neon dashboard
    - Run: `CREATE EXTENSION IF NOT EXISTS postgis;`
+3. Get connection string from Neon dashboard → Connection Details
+
+**Alternative Providers:**
+- Railway, Render, Local Docker, or any PostgreSQL with PostGIS
+- See [Database Setup Guide](docs/database_setup.md) for details
 
 ### 3. Configure Environment Variables
 
@@ -63,8 +68,10 @@ cp .env.example .env
 ```
 
 Edit `.env` and fill in:
-- Supabase database credentials
-- Mapbox access token (get from [mapbox.com](https://account.mapbox.com/access-tokens/))
+- `DATABASE_URL` - PostgreSQL connection string (from Neon, Railway, etc.)
+- `MAPBOX_ACCESS_TOKEN` - Mapbox access token (get from [mapbox.com](https://account.mapbox.com/access-tokens/))
+
+**Quick Neon Setup:** See [README_NEON_SETUP.md](README_NEON_SETUP.md) for 5-minute setup guide.
 
 ### 4. Build and Run with Docker
 

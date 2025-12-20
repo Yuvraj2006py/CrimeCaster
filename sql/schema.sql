@@ -1,7 +1,8 @@
 -- Crime Caster Toronto Database Schema
 -- PostgreSQL + PostGIS
 
--- Ensure PostGIS extension is enabled (should already be done via Supabase SQL Editor)
+-- Ensure PostGIS extension is enabled
+-- Run this in your database SQL editor (Neon, Railway, etc.)
 CREATE EXTENSION IF NOT EXISTS postgis;
 
 -- ============================================================================
@@ -19,6 +20,7 @@ CREATE TABLE IF NOT EXISTS crimes (
     premise_type VARCHAR(100),
     h3_index VARCHAR(20) NOT NULL,  -- H3 hexagon index (resolution 9)
     source_file VARCHAR(255) NOT NULL,  -- Original CSV filename
+    dataset_type VARCHAR(100),  -- Dataset type/key (e.g., 'major-crime-indicators', 'shootings-firearm-discharges')
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     
     -- PostGIS geometry column for spatial queries
@@ -31,11 +33,13 @@ CREATE INDEX IF NOT EXISTS idx_crimes_h3_index ON crimes(h3_index);
 CREATE INDEX IF NOT EXISTS idx_crimes_crime_type ON crimes(crime_type);
 CREATE INDEX IF NOT EXISTS idx_crimes_neighbourhood ON crimes(neighbourhood);
 CREATE INDEX IF NOT EXISTS idx_crimes_source_file ON crimes(source_file);
+CREATE INDEX IF NOT EXISTS idx_crimes_dataset_type ON crimes(dataset_type);
 CREATE INDEX IF NOT EXISTS idx_crimes_geom ON crimes USING GIST(geom);
 CREATE INDEX IF NOT EXISTS idx_crimes_location ON crimes(latitude, longitude);
 
 -- Composite index for common queries
 CREATE INDEX IF NOT EXISTS idx_crimes_h3_time ON crimes(h3_index, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_crimes_dataset_time ON crimes(dataset_type, occurred_at);
 
 -- ============================================================================
 -- INGESTION_METADATA TABLE
@@ -50,12 +54,14 @@ CREATE TABLE IF NOT EXISTS ingestion_metadata (
     last_timestamp TIMESTAMP WITH TIME ZONE,  -- Last crime timestamp in this file
     status VARCHAR(50) DEFAULT 'completed',  -- completed, failed, in_progress
     error_message TEXT,
+    dataset_type VARCHAR(100),  -- Dataset type/key (e.g., 'major-crime-indicators', 'shootings-firearm-discharges')
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_ingestion_file_name ON ingestion_metadata(file_name);
 CREATE INDEX IF NOT EXISTS idx_ingestion_ingested_at ON ingestion_metadata(ingested_at);
 CREATE INDEX IF NOT EXISTS idx_ingestion_last_timestamp ON ingestion_metadata(last_timestamp);
+CREATE INDEX IF NOT EXISTS idx_ingestion_dataset_type ON ingestion_metadata(dataset_type);
 
 -- ============================================================================
 -- FEATURES TABLE
@@ -204,6 +210,8 @@ LIMIT 1;
 
 COMMENT ON TABLE crimes IS 'Raw crime data from Toronto Open Data, mapped to H3 hexagons';
 COMMENT ON TABLE ingestion_metadata IS 'Tracks CSV file ingestion for incremental loading';
+COMMENT ON COLUMN crimes.dataset_type IS 'Dataset type/key: major-crime-indicators, shootings-firearm-discharges, etc.';
+COMMENT ON COLUMN ingestion_metadata.dataset_type IS 'Dataset type/key: major-crime-indicators, shootings-firearm-discharges, etc.';
 COMMENT ON TABLE features IS 'Engineered features for ML training and inference';
 COMMENT ON TABLE model_metadata IS 'ML model versions, metrics, and artifact paths';
 

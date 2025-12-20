@@ -10,11 +10,6 @@ services:
       - "8000:8000"
     environment:
       - DATABASE_URL=${DATABASE_URL}
-      - SUPABASE_URL=${SUPABASE_URL}
-      - SUPABASE_DB_HOST=${SUPABASE_DB_HOST}
-      - SUPABASE_DB_PORT=${SUPABASE_DB_PORT}
-      - SUPABASE_DB_NAME=${SUPABASE_DB_NAME}
-      - SUPABASE_DB_PASSWORD=${SUPABASE_DB_PASSWORD}
       - MAPBOX_ACCESS_TOKEN=${MAPBOX_ACCESS_TOKEN}
     volumes:
       - ./api:/app/api
@@ -60,11 +55,6 @@ services:
     container_name: crime-caster-ingestion
     environment:
       - DATABASE_URL=${DATABASE_URL}
-      - SUPABASE_URL=${SUPABASE_URL}
-      - SUPABASE_DB_HOST=${SUPABASE_DB_HOST}
-      - SUPABASE_DB_PORT=${SUPABASE_DB_PORT}
-      - SUPABASE_DB_NAME=${SUPABASE_DB_NAME}
-      - SUPABASE_DB_PASSWORD=${SUPABASE_DB_PASSWORD}
     volumes:
       - ./ingestion:/app/ingestion
       - ./validation:/app/validation
@@ -84,11 +74,6 @@ services:
     container_name: crime-caster-training
     environment:
       - DATABASE_URL=${DATABASE_URL}
-      - SUPABASE_URL=${SUPABASE_URL}
-      - SUPABASE_DB_HOST=${SUPABASE_DB_HOST}
-      - SUPABASE_DB_PORT=${SUPABASE_DB_PORT}
-      - SUPABASE_DB_NAME=${SUPABASE_DB_NAME}
-      - SUPABASE_DB_PASSWORD=${SUPABASE_DB_PASSWORD}
     volumes:
       - ./training:/app/training
       - ./feature_engineering:/app/feature_engineering

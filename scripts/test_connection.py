@@ -19,25 +19,12 @@ def test_connection(database_url: str):
         masked_url = database_url.split('@')[0] + "@[HOST]/[DB]" if '@' in database_url else "[MASKED]"
         print(f"URL (masked): {masked_url}")
         
-        # Check if using pgbouncer (connection pooling) - not supported for direct connections
+        # Check if using pgbouncer (connection pooling) - warn but allow
         if 'pgbouncer' in database_url or ':6543' in database_url:
-            print("[ERROR] Connection pooling URL detected!")
-            print("You're using a connection pooling URL (pgbouncer), which doesn't work for direct connections.")
-            print("Please use the direct connection URL (port 5432) instead.")
-            print("Get it from: https://supabase.com/dashboard/project/hibjmylxyfhcizjtmspi/settings/database")
-            print("Make sure to use the 'URI' tab, NOT the 'Connection pooling' tab.")
-            return False
+            print("[WARN] Connection pooling URL detected!")
+            print("Connection pooling may not work for migrations. Direct connection (port 5432) is recommended.")
         
-        # Try to handle IPv6-only connections on Windows
         connect_args = {'connect_timeout': 10}
-        # Force IPv4 if possible (some Supabase instances are IPv6-only)
-        try:
-            import socket
-            # Test if we can resolve to IPv4
-            socket.getaddrinfo('db.hibjmylxyfhcizjtmspi.supabase.co', 5432, socket.AF_INET)
-        except:
-            # IPv4 not available, will try IPv6
-            pass
         
         engine = create_engine(database_url, connect_args=connect_args)
         
@@ -74,9 +61,8 @@ def test_connection(database_url: str):
         if 'pgbouncer' in error_msg.lower():
             print(f"[ERROR] Connection failed: Invalid connection pooling URL detected")
             print("Your DATABASE_URL is using a connection pooling URL (pgbouncer).")
-            print("For direct database connections, you need to use the 'URI' connection string (port 5432).")
-            print("Get it from: https://supabase.com/dashboard/project/hibjmylxyfhcizjtmspi/settings/database")
-            print("Click on the 'URI' tab (NOT 'Connection pooling') and copy that connection string.")
+            print("For direct database connections, you need to use the direct connection string (port 5432).")
+            print("Get it from your database provider's dashboard (Neon, Railway, etc.)")
         else:
             print(f"[ERROR] Connection failed: {e}")
         return False
@@ -93,46 +79,31 @@ def main():
     database_url = os.getenv("DATABASE_URL")
     
     # Check if DATABASE_URL is using connection pooling (pgbouncer)
-    # If so, prefer constructing from individual variables which should use port 5432
+    # Warn but allow it (some providers use pooling)
     if database_url and ('pgbouncer' in database_url.lower() or ':6543' in database_url):
-        print("DATABASE_URL is using connection pooling (pgbouncer).")
-        print("Constructing direct connection URL from individual variables (port 5432)...")
-        host = os.getenv("SUPABASE_DB_HOST")
-        port = os.getenv("SUPABASE_DB_PORT", "5432")
-        db_name = os.getenv("SUPABASE_DB_NAME", "postgres")
-        password = os.getenv("SUPABASE_DB_PASSWORD")
-        
-        if all([host, password]):
-            database_url = f"postgresql://postgres:{password}@{host}:{port}/{db_name}"
-            print(f"Using direct connection URL with port {port}")
-        else:
-            print("[WARN] Individual variables not complete, will try DATABASE_URL anyway")
-            print("Missing variables:")
-            if not host:
-                print("  - SUPABASE_DB_HOST")
-            if not password:
-                print("  - SUPABASE_DB_PASSWORD")
+        print("[WARN] Connection pooling URL detected. This may work, but direct connection is recommended.")
     
     # If DATABASE_URL not set, try constructing from individual variables
     if not database_url:
         print("DATABASE_URL not set, constructing from individual variables...")
-        host = os.getenv("SUPABASE_DB_HOST")
-        port = os.getenv("SUPABASE_DB_PORT", "5432")
-        db_name = os.getenv("SUPABASE_DB_NAME", "postgres")
-        password = os.getenv("SUPABASE_DB_PASSWORD")
+        host = os.getenv("DB_HOST")
+        port = os.getenv("DB_PORT", "5432")
+        db_name = os.getenv("DB_NAME", "postgres")
+        db_user = os.getenv("DB_USER", "postgres")
+        password = os.getenv("DB_PASSWORD")
         
         if not all([host, password]):
             print("[ERROR] Missing required environment variables:")
             if not host:
-                print("  - SUPABASE_DB_HOST")
+                print("  - DB_HOST")
             if not password:
-                print("  - SUPABASE_DB_PASSWORD")
+                print("  - DB_PASSWORD")
             print()
-            print("Please set DATABASE_URL in your .env file with the connection string from Supabase.")
-            print("Get it from: https://supabase.com/dashboard/project/hibjmylxyfhcizjtmspi/settings/database")
+            print("Please set DATABASE_URL in your .env file with the connection string from your database provider.")
+            print("For Neon: https://console.neon.tech")
             sys.exit(1)
         
-        database_url = f"postgresql://postgres:{password}@{host}:{port}/{db_name}"
+        database_url = f"postgresql://{db_user}:{password}@{host}:{port}/{db_name}"
     
     # Test connection
     success = test_connection(database_url)
@@ -153,14 +124,14 @@ def main():
         print()
         print("Troubleshooting:")
         print("1. Make sure DATABASE_URL is set in your .env file")
-        print("2. Get the exact connection string from Supabase Dashboard:")
-        print("   https://supabase.com/dashboard/project/hibjmylxyfhcizjtmspi/settings/database")
-        print("3. IMPORTANT: Click on the 'URI' tab (NOT 'Connection pooling')")
-        print("4. Copy the connection string (should use port 5432, not 6543)")
-        print("5. Paste it as DATABASE_URL in your .env file")
+        print("2. Get the exact connection string from your database provider:")
+        print("   - Neon: https://console.neon.tech → Connection Details")
+        print("   - Railway: Railway dashboard → PostgreSQL → Connect")
+        print("   - Render: Render dashboard → PostgreSQL → Internal Database URL")
+        print("3. Copy the full connection string (including ?sslmode=require if present)")
+        print("4. Paste it as DATABASE_URL in your .env file")
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
-
