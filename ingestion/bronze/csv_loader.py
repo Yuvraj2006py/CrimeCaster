@@ -75,20 +75,25 @@ def get_data_directory() -> Path:
 
 def discover_resource_id(dataset_key: str, timeout: int = 30) -> Optional[str]:
     """
-    Discover resource ID for a dataset using CKAN API.
+    Discover resource ID and download URL for a dataset using CKAN API.
+    
+    Uses proper CKAN API pattern:
+    - For datastore_active resources: Use /datastore/dump/ endpoint
+    - For non-datastore resources: Use resource_show to get download URL
     
     Args:
         dataset_key: Dataset key from TORONTO_DATASETS
         timeout: Request timeout in seconds
         
     Returns:
-        Resource ID (string) or direct URL (if no resource ID available), or None if not found
+        Resource ID (string) for datastore resources, or direct URL (string) for file resources, or None if not found
     """
     try:
+        # Step 1: Get package metadata
         api_url = f"{TORONTO_CKAN_API}/package_show"
         params = {"id": dataset_key}
         
-        logger.debug(f"Discovering resource ID for {dataset_key} via CKAN API...")
+        logger.debug(f"Discovering resource for {dataset_key} via CKAN API...")
         
         with httpx.Client(timeout=timeout, follow_redirects=True) as client:
             response = client.get(api_url, params=params)
@@ -111,7 +116,8 @@ def discover_resource_id(dataset_key: str, timeout: int = 30) -> Optional[str]:
                 logger.warning(f"No resources found for dataset {dataset_key}")
                 return None
             
-            # Find CSV resource (prefer CSV format)
+            # Step 2: Process each resource
+            # Prefer CSV format, but accept any downloadable resource
             csv_resource = None
             for resource in resources:
                 resource_format = resource.get("format", "").upper()
@@ -119,33 +125,71 @@ def discover_resource_id(dataset_key: str, timeout: int = 30) -> Optional[str]:
                     csv_resource = resource
                     break
             
-            # If no CSV found, try to find any downloadable resource with a URL
+            # If no CSV found, try to find any downloadable resource
             if not csv_resource and resources:
                 for resource in resources:
-                    if resource.get("url") or resource.get("download_url"):
+                    if resource.get("url") or resource.get("download_url") or resource.get("datastore_active"):
                         csv_resource = resource
                         break
             
-            if csv_resource:
-                resource_id = csv_resource.get("id")
-                resource_url = csv_resource.get("url") or csv_resource.get("download_url")
-                
-                if resource_id:
-                    logger.info(
-                        f"Discovered resource ID for {dataset_key}: {resource_id}"
-                    )
-                    # Update the dataset config with discovered resource ID
-                    TORONTO_DATASETS[dataset_key]["resource_id"] = resource_id
-                    return resource_id
-                elif resource_url:
-                    # If we have a direct URL but no resource ID, return the URL
-                    logger.info(f"Found direct URL for {dataset_key}: {resource_url}")
-                    TORONTO_DATASETS[dataset_key]["direct_url"] = resource_url
-                    return resource_url
-            else:
-                logger.warning(f"No downloadable CSV resource found for {dataset_key}")
+            if not csv_resource:
+                logger.warning(f"No downloadable resource found for {dataset_key}")
                 logger.debug(f"Available resources: {[r.get('format') for r in resources]}")
                 return None
+            
+            resource_id = csv_resource.get("id")
+            is_datastore = csv_resource.get("datastore_active", False)
+            
+            # Step 3: Handle datastore_active resources
+            if is_datastore and resource_id:
+                # For datastore resources, return resource ID
+                # Download will use /datastore/dump/ endpoint
+                logger.info(f"Discovered datastore resource ID for {dataset_key}: {resource_id}")
+                TORONTO_DATASETS[dataset_key]["resource_id"] = resource_id
+                TORONTO_DATASETS[dataset_key]["datastore_active"] = True
+                return resource_id
+            
+            # Step 4: Handle non-datastore resources - get download URL
+            if not is_datastore and resource_id:
+                # Get resource metadata to find download URL
+                resource_show_url = f"{TORONTO_CKAN_API}/resource_show"
+                resource_params = {"id": resource_id}
+                
+                try:
+                    resource_response = client.get(resource_show_url, params=resource_params)
+                    resource_response.raise_for_status()
+                    resource_data = resource_response.json()
+                    
+                    if resource_data.get("success") and "result" in resource_data:
+                        resource_url = (
+                            resource_data["result"].get("url") or 
+                            resource_data["result"].get("download_url")
+                        )
+                        
+                        if resource_url:
+                            logger.info(f"Found download URL for {dataset_key}: {resource_url}")
+                            TORONTO_DATASETS[dataset_key]["direct_url"] = resource_url
+                            TORONTO_DATASETS[dataset_key]["resource_id"] = resource_id
+                            return resource_url
+                except Exception as e:
+                    logger.warning(f"Failed to get resource metadata for {resource_id}: {e}")
+            
+            # Fallback: Use URL from package_show if available
+            resource_url = csv_resource.get("url") or csv_resource.get("download_url")
+            if resource_url:
+                logger.info(f"Found direct URL for {dataset_key}: {resource_url}")
+                TORONTO_DATASETS[dataset_key]["direct_url"] = resource_url
+                if resource_id:
+                    TORONTO_DATASETS[dataset_key]["resource_id"] = resource_id
+                return resource_url
+            
+            # If we have resource_id but no URL, return it (will construct URL)
+            if resource_id:
+                logger.info(f"Discovered resource ID for {dataset_key}: {resource_id}")
+                TORONTO_DATASETS[dataset_key]["resource_id"] = resource_id
+                return resource_id
+            
+            return None
                 
     except httpx.TimeoutException:
         logger.error(f"Timeout discovering resource ID for {dataset_key}")
@@ -161,24 +205,36 @@ def discover_resource_id(dataset_key: str, timeout: int = 30) -> Optional[str]:
         return None
 
 
-def download_csv(url: str, output_path: Path, timeout: int = 300) -> bool:
+def download_csv(url: str, output_path: Path, timeout: int = 300, is_datastore: bool = False, resource_id: Optional[str] = None) -> bool:
     """
-    Download CSV file from URL.
+    Download CSV file from URL or CKAN datastore.
     
     Args:
-        url: URL to download from
+        url: URL to download from (or base URL if is_datastore=True)
         output_path: Path to save the file
         timeout: Request timeout in seconds
+        is_datastore: If True, use /datastore/dump/ endpoint
+        resource_id: Resource ID for datastore downloads
         
     Returns:
         True if successful, False otherwise
     """
     try:
-        logger.info(f"Downloading CSV from: {url}")
+        # Handle datastore_active resources
+        if is_datastore and resource_id:
+            # Use CKAN datastore dump endpoint
+            base_url = "https://ckan0.cf.opendata.inter.prod-toronto.ca"
+            datastore_url = f"{base_url}/datastore/dump/{resource_id}"
+            logger.info(f"Downloading from datastore: {datastore_url}")
+            download_url = datastore_url
+        else:
+            download_url = url
+            logger.info(f"Downloading CSV from: {download_url}")
+        
         logger.info(f"Saving to: {output_path}")
         
         with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-            response = client.get(url)
+            response = client.get(download_url)
             response.raise_for_status()
             
             # Save to file
@@ -190,6 +246,12 @@ def download_csv(url: str, output_path: Path, timeout: int = 300) -> bool:
             logger.info(f"Downloaded {file_size:.2f} MB successfully")
             return True
             
+    except httpx.TimeoutException:
+        logger.error(f"Timeout downloading CSV from {download_url}")
+        return False
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP error downloading CSV: Client error '{e.response.status_code} {e.response.reason_phrase}' for url '{download_url}'\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/{e.response.status_code}")
+        return False
     except httpx.HTTPError as e:
         logger.error(f"HTTP error downloading CSV: {e}")
         return False
@@ -228,6 +290,7 @@ def download_single_dataset(
     # Get resource ID
     resource_id = dataset_info.get("resource_id")
     direct_url = dataset_info.get("direct_url")
+    is_datastore = dataset_info.get("datastore_active", False)
     
     # Discover resource ID if not configured
     if not resource_id and not direct_url and discover_if_missing:
@@ -239,6 +302,8 @@ def download_single_dataset(
                 direct_url = discovered
             else:
                 resource_id = discovered
+                # Check if datastore_active was set during discovery
+                is_datastore = dataset_info.get("datastore_active", False)
     
     # Construct URL
     if direct_url:
@@ -265,7 +330,7 @@ def download_single_dataset(
         return dataset_key, file_path
     
     # Download
-    if download_csv(url, file_path):
+    if download_csv(url, file_path, is_datastore=is_datastore, resource_id=resource_id):
         return dataset_key, file_path
     else:
         logger.error(f"Failed to download {dataset_key}")
@@ -274,7 +339,7 @@ def download_single_dataset(
 
 def load_csv(file_path: Path) -> Optional[pd.DataFrame]:
     """
-    Load CSV file into pandas DataFrame.
+    Load CSV file into pandas DataFrame with robust error handling.
     
     Args:
         file_path: Path to CSV file
@@ -282,28 +347,227 @@ def load_csv(file_path: Path) -> Optional[pd.DataFrame]:
     Returns:
         DataFrame or None if error
     """
+    # #region agent log
+    import json
+    log_path = Path(".cursor/debug.log")
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            json.dump({
+                "sessionId": "debug-session",
+                "runId": "csv-load",
+                "hypothesisId": "A",
+                "location": f"{file_path}:load_csv",
+                "message": "Starting CSV load",
+                "data": {"file_path": str(file_path)},
+                "timestamp": int(__import__("time").time() * 1000)
+            }, f)
+            f.write("\n")
+    except: pass
+    # #endregion
+    
     try:
         logger.info(f"Loading CSV: {file_path}")
         
-        # Try different encodings
+        # Detect file format by checking magic bytes (Excel files start with PK)
+        is_excel = False
+        try:
+            with open(file_path, 'rb') as f:
+                header = f.read(4)
+                # Excel files (XLSX) are ZIP archives, start with PK\x03\x04
+                # XLS files start with different bytes
+                if header.startswith(b'PK\x03\x04') or file_path.suffix.lower() in ['.xlsx', '.xls']:
+                    is_excel = True
+        except Exception:
+            pass
+        
+        # Handle Excel files
+        if is_excel:
+            # #region agent log
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    json.dump({
+                        "sessionId": "debug-session",
+                        "runId": "csv-load",
+                        "hypothesisId": "H",
+                        "location": f"{file_path}:load_csv",
+                        "message": "Detected Excel file, using read_excel",
+                        "data": {"file_path": str(file_path), "extension": file_path.suffix},
+                        "timestamp": int(__import__("time").time() * 1000)
+                    }, f)
+                    f.write("\n")
+            except: pass
+            # #endregion
+            
+            try:
+                df = pd.read_excel(file_path, engine='openpyxl')
+                logger.info(f"Successfully loaded Excel file with openpyxl")
+                
+                # #region agent log
+                try:
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        json.dump({
+                            "sessionId": "debug-session",
+                            "runId": "csv-load",
+                            "hypothesisId": "I",
+                            "location": f"{file_path}:load_csv",
+                            "message": "Excel file loaded successfully",
+                            "data": {"rows": len(df), "cols": len(df.columns)},
+                            "timestamp": int(__import__("time").time() * 1000)
+                        }, f)
+                        f.write("\n")
+                except: pass
+                # #endregion
+                
+                logger.info(f"Loaded {len(df):,} rows, {len(df.columns)} columns")
+                logger.info(f"Columns: {', '.join(df.columns[:10])}...")
+                return df
+            except ImportError:
+                logger.warning("openpyxl not installed, trying xlrd")
+                try:
+                    df = pd.read_excel(file_path, engine='xlrd')
+                    logger.info(f"Successfully loaded Excel file with xlrd")
+                    logger.info(f"Loaded {len(df):,} rows, {len(df.columns)} columns")
+                    return df
+                except Exception as excel_error:
+                    logger.error(f"Failed to read Excel file: {excel_error}")
+                    return None
+            except Exception as excel_error:
+                logger.error(f"Error reading Excel file: {excel_error}")
+                return None
+        
+        # Try different encodings for CSV files
         encodings = ["utf-8", "latin-1", "iso-8859-1", "cp1252"]
         df = None
+        last_error = None
         
         for encoding in encodings:
             try:
-                df = pd.read_csv(
-                    file_path,
-                    encoding=encoding,
-                    low_memory=False,
-                    parse_dates=False,  # We'll parse dates manually
-                )
-                logger.info(f"Successfully loaded CSV with encoding: {encoding}")
-                break
-            except UnicodeDecodeError:
+                # #region agent log
+                try:
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        json.dump({
+                            "sessionId": "debug-session",
+                            "runId": "csv-load",
+                            "hypothesisId": "B",
+                            "location": f"{file_path}:load_csv",
+                            "message": "Trying encoding",
+                            "data": {"encoding": encoding},
+                            "timestamp": int(__import__("time").time() * 1000)
+                        }, f)
+                        f.write("\n")
+                except: pass
+                # #endregion
+                
+                # Try C engine first (faster, better error messages)
+                try:
+                    df = pd.read_csv(
+                        file_path,
+                        encoding=encoding,
+                        low_memory=False,
+                        parse_dates=False,
+                        on_bad_lines='skip',
+                        engine='c',  # C engine first
+                    )
+                    logger.info(f"Successfully loaded CSV with encoding: {encoding}")
+                    
+                    # #region agent log
+                    try:
+                        with open(log_path, "a", encoding="utf-8") as f:
+                            json.dump({
+                                "sessionId": "debug-session",
+                                "runId": "csv-load",
+                                "hypothesisId": "C",
+                                "location": f"{file_path}:load_csv",
+                                "message": "CSV loaded successfully",
+                                "data": {"encoding": encoding, "rows": len(df), "cols": len(df.columns)},
+                                "timestamp": int(__import__("time").time() * 1000)
+                            }, f)
+                            f.write("\n")
+                    except: pass
+                    # #endregion
+                    
+                    break
+                except UnicodeDecodeError:
+                    # Try next encoding
+                    continue
+            except UnicodeDecodeError as e:
+                last_error = e
                 continue
+            except pd.errors.ParserError as e:
+                # #region agent log
+                try:
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        json.dump({
+                            "sessionId": "debug-session",
+                            "runId": "csv-load",
+                            "hypothesisId": "D",
+                            "location": f"{file_path}:load_csv",
+                            "message": "ParserError encountered",
+                            "data": {"encoding": encoding, "error": str(e)},
+                            "timestamp": int(__import__("time").time() * 1000)
+                        }, f)
+                        f.write("\n")
+                except: pass
+                # #endregion
+                
+                logger.warning(f"CSV parsing error with encoding {encoding}: {e}")
+                logger.info("Retrying with error handling options...")
+                
+                # Retry with Python engine (more lenient, but no low_memory option)
+                try:
+                    df = pd.read_csv(
+                        file_path,
+                        encoding=encoding,
+                        parse_dates=False,
+                        on_bad_lines='skip',  # Skip bad lines
+                        engine='python',  # Python engine - note: no low_memory option
+                        sep=',',  # Explicit separator
+                        quotechar='"',
+                        skipinitialspace=True,
+                    )
+                    logger.info(f"Successfully loaded CSV with encoding: {encoding} (with error handling)")
+                    
+                    # #region agent log
+                    try:
+                        with open(log_path, "a", encoding="utf-8") as f:
+                            json.dump({
+                                "sessionId": "debug-session",
+                                "runId": "csv-load",
+                                "hypothesisId": "E",
+                                "location": f"{file_path}:load_csv",
+                                "message": "CSV loaded with error handling",
+                                "data": {"encoding": encoding, "rows": len(df), "cols": len(df.columns)},
+                                "timestamp": int(__import__("time").time() * 1000)
+                            }, f)
+                            f.write("\n")
+                    except: pass
+                    # #endregion
+                    
+                    break
+                except Exception as retry_error:
+                    logger.warning(f"Retry also failed: {retry_error}")
+                    last_error = retry_error
+                    continue
         
         if df is None:
-            logger.error("Failed to load CSV with any encoding")
+            logger.error(f"Failed to load CSV with any encoding. Last error: {last_error}")
+            
+            # #region agent log
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    json.dump({
+                        "sessionId": "debug-session",
+                        "runId": "csv-load",
+                        "hypothesisId": "F",
+                        "location": f"{file_path}:load_csv",
+                        "message": "CSV load failed",
+                        "data": {"last_error": str(last_error)},
+                        "timestamp": int(__import__("time").time() * 1000)
+                    }, f)
+                    f.write("\n")
+            except: pass
+            # #endregion
+            
             return None
         
         logger.info(f"Loaded {len(df):,} rows, {len(df.columns)} columns")
@@ -313,6 +577,23 @@ def load_csv(file_path: Path) -> Optional[pd.DataFrame]:
         
     except Exception as e:
         logger.error(f"Error loading CSV: {e}")
+        
+        # #region agent log
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                json.dump({
+                    "sessionId": "debug-session",
+                    "runId": "csv-load",
+                    "hypothesisId": "G",
+                    "location": f"{file_path}:load_csv",
+                    "message": "Unexpected error",
+                    "data": {"error": str(e), "error_type": type(e).__name__},
+                    "timestamp": int(__import__("time").time() * 1000)
+                }, f)
+                f.write("\n")
+        except: pass
+        # #endregion
+        
         return None
 
 

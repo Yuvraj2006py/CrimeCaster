@@ -81,7 +81,7 @@ def run_silver_layer() -> bool:
     
     try:
         from ingestion.silver.cleaner import main as silver_main
-        silver_main()
+        silver_main(process_all=True)  # Process all Bronze files
         logger.success("✅ Silver layer completed successfully")
         return True
     except SystemExit as e:
@@ -105,7 +105,7 @@ def run_gold_layer() -> bool:
     
     try:
         from transformations.gold.h3_mapper import main as gold_main
-        gold_main()
+        gold_main(process_all=True)  # Process all Silver files
         logger.success("✅ Gold layer completed successfully")
         return True
     except SystemExit as e:

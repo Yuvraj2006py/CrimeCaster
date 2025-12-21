@@ -58,6 +58,13 @@ def find_latest_bronze_file(raw_dir: Path) -> Optional[Path]:
     return latest
 
 
+def find_all_bronze_files(raw_dir: Path) -> list[Path]:
+    """Find all CSV files in raw directory."""
+    csv_files = list(raw_dir.glob("*.csv"))
+    # Sort by modification time (oldest first for consistent processing)
+    return sorted(csv_files, key=lambda p: p.stat().st_mtime)
+
+
 def load_bronze_csv(csv_path: Path, chunk_size: Optional[int] = None) -> pd.DataFrame:
     """
     Load CSV from Bronze layer.
@@ -502,48 +509,33 @@ def save_silver_data(df: pd.DataFrame, output_path: Path):
         raise
 
 
-def main(
-    input_file: Optional[str] = None,
+def process_single_file(
+    csv_path: Path,
     output_file: Optional[str] = None,
     skip_validation: bool = False,
-):
+) -> bool:
     """
-    Main Silver layer cleaning function.
+    Process a single Bronze CSV file through Silver layer.
     
     Args:
-        input_file: Path to Bronze CSV file (if None, uses latest)
+        csv_path: Path to Bronze CSV file
         output_file: Path to save cleaned CSV (if None, auto-generates)
         skip_validation: Skip coordinate validation (not recommended)
+        
+    Returns:
+        True if successful, False otherwise
     """
-    setup_logging()
-    logger.info("=" * 60)
-    logger.info("Silver Layer: Data Cleaning")
-    logger.info("=" * 60)
-    
-    # Get directories
+    source_file = csv_path.name
     raw_dir, silver_dir = get_data_directories()
     
-    # Determine input file
-    if input_file:
-        csv_path = Path(input_file)
-        if not csv_path.exists():
-            logger.error(f"Input file not found: {csv_path}")
-            sys.exit(1)
-    else:
-        csv_path = find_latest_bronze_file(raw_dir)
-        if not csv_path:
-            logger.error(f"No CSV files found in {raw_dir}")
-            sys.exit(1)
-        logger.info(f"Using latest Bronze file: {csv_path.name}")
-    
-    source_file = csv_path.name
+    logger.info(f"Processing: {csv_path.name}")
     
     # Load Bronze data
     try:
         df = load_bronze_csv(csv_path)
     except Exception as e:
-        logger.error(f"Failed to load Bronze CSV: {e}")
-        sys.exit(1)
+        logger.error(f"Failed to load Bronze CSV {csv_path.name}: {e}")
+        return False
     
     initial_count = len(df)
     logger.info(f"Starting with {initial_count:,} rows")
@@ -564,28 +556,111 @@ def main(
     try:
         df_clean = transform_to_schema(df, source_file)
     except Exception as e:
-        logger.error(f"Transformation failed: {e}")
-        sys.exit(1)
+        logger.error(f"Transformation failed for {csv_path.name}: {e}")
+        return False
     
     # Step 4: Save cleaned data
     if output_file:
         output_path = Path(output_file)
     else:
-        # Generate output filename
+        # Generate output filename based on source file
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = silver_dir / f"cleaned_crime_data_{timestamp}.csv"
+        # Extract dataset name from source file (e.g., "major-crime-indicators_20251221_110200.csv" -> "major-crime-indicators")
+        dataset_name = csv_path.stem.split("_")[0] if "_" in csv_path.stem else csv_path.stem
+        output_path = silver_dir / f"cleaned_{dataset_name}_{timestamp}.csv"
     
-    save_silver_data(df_clean, output_path)
+    try:
+        save_silver_data(df_clean, output_path)
+    except Exception as e:
+        logger.error(f"Failed to save cleaned data for {csv_path.name}: {e}")
+        return False
     
     # Summary
     logger.info("=" * 60)
-    logger.info("Silver Layer Cleaning Complete!")
+    logger.info(f"Silver Layer Complete for {csv_path.name}!")
     logger.info("=" * 60)
     logger.info(f"Initial rows: {initial_count:,}")
     logger.info(f"Final rows: {len(df_clean):,}")
     logger.info(f"Removed: {initial_count - len(df_clean):,} ({((initial_count - len(df_clean))/initial_count*100):.2f}%)")
     logger.info(f"Cleaned data saved to: {output_path}")
-    logger.info(f"Next step: Run Gold layer to map H3 and load into database")
+    
+    return True
+
+
+def main(
+    input_file: Optional[str] = None,
+    output_file: Optional[str] = None,
+    skip_validation: bool = False,
+    process_all: bool = False,
+):
+    """
+    Main Silver layer cleaning function.
+    
+    Args:
+        input_file: Path to Bronze CSV file (if None, uses latest or all files)
+        output_file: Path to save cleaned CSV (if None, auto-generates)
+        skip_validation: Skip coordinate validation (not recommended)
+        process_all: If True, process all Bronze files (ignores input_file)
+    """
+    setup_logging()
+    logger.info("=" * 60)
+    logger.info("Silver Layer: Data Cleaning")
+    logger.info("=" * 60)
+    
+    # Get directories
+    raw_dir, silver_dir = get_data_directories()
+    
+    # Process all files if requested
+    if process_all:
+        csv_files = find_all_bronze_files(raw_dir)
+        if not csv_files:
+            logger.error(f"No CSV files found in {raw_dir}")
+            sys.exit(1)
+        
+        logger.info(f"Processing {len(csv_files)} Bronze files...")
+        logger.info("")
+        
+        success_count = 0
+        failed_count = 0
+        
+        for csv_path in csv_files:
+            logger.info("")
+            logger.info("=" * 60)
+            logger.info(f"Processing file {csv_files.index(csv_path) + 1}/{len(csv_files)}")
+            logger.info("=" * 60)
+            
+            if process_single_file(csv_path, skip_validation=skip_validation):
+                success_count += 1
+            else:
+                failed_count += 1
+                logger.warning(f"Failed to process {csv_path.name}")
+        
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("Silver Layer: All Files Processing Complete!")
+        logger.info("=" * 60)
+        logger.info(f"Successfully processed: {success_count}/{len(csv_files)} files")
+        if failed_count > 0:
+            logger.warning(f"Failed: {failed_count}/{len(csv_files)} files")
+        logger.info(f"Next step: Run Gold layer to map H3 and load into database")
+        return
+    
+    # Process single file
+    # Determine input file
+    if input_file:
+        csv_path = Path(input_file)
+        if not csv_path.exists():
+            logger.error(f"Input file not found: {csv_path}")
+            sys.exit(1)
+    else:
+        csv_path = find_latest_bronze_file(raw_dir)
+        if not csv_path:
+            logger.error(f"No CSV files found in {raw_dir}")
+            sys.exit(1)
+        logger.info(f"Using latest Bronze file: {csv_path.name}")
+    
+    if not process_single_file(csv_path, output_file, skip_validation):
+        sys.exit(1)
 
 
 if __name__ == "__main__":
@@ -607,6 +682,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip coordinate validation (not recommended)",
     )
+    parser.add_argument(
+        "--process-all",
+        action="store_true",
+        help="Process all Bronze CSV files (ignores --input)",
+    )
     
     args = parser.parse_args()
     
@@ -614,5 +694,6 @@ if __name__ == "__main__":
         input_file=args.input,
         output_file=args.output,
         skip_validation=args.skip_validation,
+        process_all=args.process_all,
     )
 

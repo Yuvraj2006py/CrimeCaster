@@ -24,7 +24,8 @@ load_dotenv()
 H3_RESOLUTION = 9
 
 # Batch size for database inserts (optimize for performance)
-BATCH_SIZE = 10000
+# Reduced to 1000 to avoid PostgreSQL parameter limit (9 cols × 1000 rows = 9,000 params < 65,535 limit)
+BATCH_SIZE = 1000
 
 # Toronto coordinate bounds for validation
 TORONTO_LAT_MIN = 43.5
@@ -93,6 +94,13 @@ def get_database_connection():
         return engine
     except Exception as e:
         raise ValueError(f"Failed to connect to database: {e}")
+
+
+def find_all_silver_files(silver_dir: Path) -> list[Path]:
+    """Find all cleaned CSV files in Silver directory."""
+    csv_files = list(silver_dir.glob("cleaned_*.csv"))
+    # Sort by modification time (oldest first for consistent processing)
+    return sorted(csv_files, key=lambda p: p.stat().st_mtime)
 
 
 def find_latest_silver_file(silver_dir: Path) -> Optional[Path]:
@@ -361,6 +369,15 @@ def batch_insert_crimes(engine, df: pd.DataFrame, batch_size: int = BATCH_SIZE) 
     Returns:
         Tuple of (successful_rows, failed_rows)
     """
+    # #region agent log
+    import json
+    log_path = Path(__file__).parent.parent.parent / ".cursor" / "debug.log"
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"sessionId": "debug-session", "runId": "run1", "hypothesisId": "A", "location": "h3_mapper.py:351", "message": "batch_insert_crimes entry", "data": {"batch_size_param": batch_size, "BATCH_SIZE_constant": BATCH_SIZE, "total_rows": len(df), "df_columns": list(df.columns), "df_column_count": len(df.columns)}, "timestamp": int(datetime.now().timestamp() * 1000)}) + "\n")
+    except: pass
+    # #endregion
+    
     total_rows = len(df)
     successful_rows = 0
     failed_rows = 0
@@ -375,18 +392,34 @@ def batch_insert_crimes(engine, df: pd.DataFrame, batch_size: int = BATCH_SIZE) 
         end_idx = min(start_idx + batch_size, total_rows)
         batch_df = df.iloc[start_idx:end_idx].copy()
         
+        # #region agent log
         try:
-            # Use pandas to_sql for efficient bulk insert
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"sessionId": "debug-session", "runId": "run1", "hypothesisId": "B,C,D", "location": "h3_mapper.py:377", "message": "before batch insert", "data": {"batch_num": batch_num + 1, "num_batches": num_batches, "batch_rows": len(batch_df), "batch_columns": list(batch_df.columns), "batch_column_count": len(batch_df.columns), "calculated_params": len(batch_df) * len(batch_df.columns), "start_idx": start_idx, "end_idx": end_idx}, "timestamp": int(datetime.now().timestamp() * 1000)}) + "\n")
+        except: pass
+        # #endregion
+        
+        try:
+            # Use pandas to_sql with executemany (method=None) to avoid PostgreSQL parameter limit
+            # method="multi" creates a single INSERT with all parameters, which can exceed PostgreSQL's limit
+            # method=None uses executemany which is slower but doesn't hit parameter limits
             batch_df.to_sql(
                 "crimes",
                 engine,
                 if_exists="append",
                 index=False,
-                method="multi",  # Use multi-row INSERT for speed
+                method=None,  # Use executemany to avoid parameter limit issues
             )
             
             batch_success = len(batch_df)
             successful_rows += batch_success
+            
+            # #region agent log
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"sessionId": "debug-session", "runId": "run1", "hypothesisId": "A", "location": "h3_mapper.py:389", "message": "batch insert success", "data": {"batch_num": batch_num + 1, "rows_inserted": batch_success}, "timestamp": int(datetime.now().timestamp() * 1000)}) + "\n")
+            except: pass
+            # #endregion
             
             # Log progress
             progress = (batch_num + 1) / num_batches * 100
@@ -396,6 +429,13 @@ def batch_insert_crimes(engine, df: pd.DataFrame, batch_size: int = BATCH_SIZE) 
             )
             
         except SQLAlchemyError as e:
+            # #region agent log
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"sessionId": "debug-session", "runId": "run1", "hypothesisId": "E", "location": "h3_mapper.py:399", "message": "SQLAlchemyError caught", "data": {"batch_num": batch_num + 1, "error_type": type(e).__name__, "error_message": str(e), "batch_rows": len(batch_df), "batch_columns": len(batch_df.columns), "calculated_params": len(batch_df) * len(batch_df.columns)}, "timestamp": int(datetime.now().timestamp() * 1000)}) + "\n")
+            except: pass
+            # #endregion
+            
             logger.error(f"Error inserting batch {batch_num + 1}: {e}")
             failed_rows += len(batch_df)
             
@@ -481,7 +521,8 @@ def verify_database_insertion(engine, source_file: str, expected_count: int) -> 
         True if verification passes
     """
     try:
-        with engine.connect() as conn:
+        # Use engine.begin() to ensure we see committed data
+        with engine.begin() as conn:
             # Count records
             result = conn.execute(
                 text("SELECT COUNT(*) FROM crimes WHERE source_file = :source_file"),
@@ -533,71 +574,45 @@ def verify_database_insertion(engine, source_file: str, expected_count: int) -> 
         return False
 
 
-def main(
-    input_file: Optional[str] = None,
+def process_single_file(
+    csv_path: Path,
+    engine,
     batch_size: int = BATCH_SIZE,
     skip_existing: bool = True,
     verify: bool = True,
-):
+) -> bool:
     """
-    Main Gold layer function: Map to H3 and load into database.
+    Process a single Silver CSV file through Gold layer.
     
     Args:
-        input_file: Path to Silver CSV file (if None, uses latest)
+        csv_path: Path to Silver CSV file
+        engine: Database engine
         batch_size: Number of rows per batch insert
         skip_existing: Skip if records already exist for this file
         verify: Verify database insertion after completion
+        
+    Returns:
+        True if successful, False otherwise
     """
-    setup_logging()
-    logger.info("=" * 60)
-    logger.info("Gold Layer: H3 Mapping and Database Loading")
-    logger.info("=" * 60)
-    
-    # Get directories
-    silver_dir, gold_dir = get_data_directories()
-    
-    # Determine input file
-    if input_file:
-        csv_path = Path(input_file)
-        if not csv_path.exists():
-            logger.error(f"Input file not found: {csv_path}")
-            sys.exit(1)
-    else:
-        csv_path = find_latest_silver_file(silver_dir)
-        if not csv_path:
-            logger.error(f"No CSV files found in {silver_dir}")
-            sys.exit(1)
-        logger.info(f"Using latest Silver file: {csv_path.name}")
-    
     source_file = csv_path.name
     
-    # Get database connection
-    try:
-        engine = get_database_connection()
-        logger.info("Database connection established")
-    except Exception as e:
-        logger.error(f"Failed to connect to database: {e}")
-        sys.exit(1)
+    logger.info(f"Processing: {csv_path.name}")
     
     # Check if already loaded
     if skip_existing:
         existing_count = check_existing_records(engine, source_file)
         if existing_count > 0:
             logger.warning(
-                f"Found {existing_count:,} existing records for {source_file}. "
-                "Use --no-skip-existing to reload."
+                f"Found {existing_count:,} existing records for {source_file}. Skipping."
             )
-            response = input("Continue anyway? (y/n): ").lower().strip()
-            if response != "y":
-                logger.info("Aborted by user")
-                return
+            return True  # Consider it successful if already exists
     
     # Load Silver data
     try:
         df = load_silver_csv(csv_path)
     except Exception as e:
-        logger.error(f"Failed to load Silver CSV: {e}")
-        sys.exit(1)
+        logger.error(f"Failed to load Silver CSV {csv_path.name}: {e}")
+        return False
     
     initial_count = len(df)
     logger.info(f"Starting with {initial_count:,} rows from Silver layer")
@@ -606,15 +621,15 @@ def main(
     try:
         df = map_to_h3(df)
     except Exception as e:
-        logger.error(f"Failed to map H3 indices: {e}")
-        sys.exit(1)
+        logger.error(f"Failed to map H3 indices for {csv_path.name}: {e}")
+        return False
     
     # Prepare for database
     try:
         df_db = prepare_for_database(df)
     except Exception as e:
-        logger.error(f"Failed to prepare data for database: {e}")
-        sys.exit(1)
+        logger.error(f"Failed to prepare data for database for {csv_path.name}: {e}")
+        return False
     
     final_count = len(df_db)
     if final_count < initial_count:
@@ -631,16 +646,17 @@ def main(
         successful_rows, failed_rows = batch_insert_crimes(engine, df_db, batch_size=batch_size)
         
         logger.info("=" * 60)
-        logger.info("Insertion Summary")
+        logger.info(f"Insertion Summary for {csv_path.name}")
         logger.info("=" * 60)
         logger.info(f"Successful: {successful_rows:,} rows")
         if failed_rows > 0:
             logger.warning(f"Failed: {failed_rows:,} rows")
-        logger.info(f"Success rate: {successful_rows/(successful_rows+failed_rows)*100:.2f}%")
+        if successful_rows + failed_rows > 0:
+            logger.info(f"Success rate: {successful_rows/(successful_rows+failed_rows)*100:.2f}%")
         
     except Exception as e:
-        logger.error(f"Database insertion failed: {e}")
-        sys.exit(1)
+        logger.error(f"Database insertion failed for {csv_path.name}: {e}")
+        return False
     
     # Update ingestion metadata
     if successful_rows > 0:
@@ -651,8 +667,95 @@ def main(
         verify_database_insertion(engine, source_file, successful_rows)
     
     logger.info("=" * 60)
-    logger.info("Gold Layer Complete!")
+    logger.info(f"Gold Layer Complete for {csv_path.name}!")
     logger.info("=" * 60)
+    
+    return True
+
+
+def main(
+    input_file: Optional[str] = None,
+    batch_size: int = BATCH_SIZE,
+    skip_existing: bool = True,
+    verify: bool = True,
+    process_all: bool = False,
+):
+    """
+    Main Gold layer function: Map to H3 and load into database.
+    
+    Args:
+        input_file: Path to Silver CSV file (if None, uses latest or all files)
+        batch_size: Number of rows per batch insert
+        skip_existing: Skip if records already exist for this file
+        verify: Verify database insertion after completion
+        process_all: If True, process all Silver files (ignores input_file)
+    """
+    setup_logging()
+    logger.info("=" * 60)
+    logger.info("Gold Layer: H3 Mapping and Database Loading")
+    logger.info("=" * 60)
+    
+    # Get database connection
+    try:
+        engine = get_database_connection()
+        logger.info("Database connection established")
+    except Exception as e:
+        logger.error(f"Failed to connect to database: {e}")
+        sys.exit(1)
+    
+    # Get directories
+    silver_dir, gold_dir = get_data_directories()
+    
+    # Process all files if requested
+    if process_all:
+        csv_files = find_all_silver_files(silver_dir)
+        if not csv_files:
+            logger.error(f"No cleaned CSV files found in {silver_dir}")
+            sys.exit(1)
+        
+        logger.info(f"Processing {len(csv_files)} Silver files...")
+        logger.info("")
+        
+        success_count = 0
+        failed_count = 0
+        
+        for csv_path in csv_files:
+            logger.info("")
+            logger.info("=" * 60)
+            logger.info(f"Processing file {csv_files.index(csv_path) + 1}/{len(csv_files)}")
+            logger.info("=" * 60)
+            
+            if process_single_file(csv_path, engine, batch_size, skip_existing, verify):
+                success_count += 1
+            else:
+                failed_count += 1
+                logger.warning(f"Failed to process {csv_path.name}")
+        
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("Gold Layer: All Files Processing Complete!")
+        logger.info("=" * 60)
+        logger.info(f"Successfully processed: {success_count}/{len(csv_files)} files")
+        if failed_count > 0:
+            logger.warning(f"Failed: {failed_count}/{len(csv_files)} files")
+        return
+    
+    # Process single file
+    # Determine input file
+    if input_file:
+        csv_path = Path(input_file)
+        if not csv_path.exists():
+            logger.error(f"Input file not found: {csv_path}")
+            sys.exit(1)
+    else:
+        csv_path = find_latest_silver_file(silver_dir)
+        if not csv_path:
+            logger.error(f"No CSV files found in {silver_dir}")
+            sys.exit(1)
+        logger.info(f"Using latest Silver file: {csv_path.name}")
+    
+    if not process_single_file(csv_path, engine, batch_size, skip_existing, verify):
+        sys.exit(1)
     logger.info(f"Loaded {successful_rows:,} crime records into database")
     logger.info(f"Data is now available for feature engineering and ML training")
 
@@ -661,6 +764,11 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Gold layer: H3 mapping and database loading")
+    parser.add_argument(
+        "--process-all",
+        action="store_true",
+        help="Process all Silver CSV files (ignores --input)",
+    )
     parser.add_argument(
         "--input",
         type=str,
@@ -690,5 +798,6 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         skip_existing=not args.no_skip_existing,
         verify=not args.no_verify,
+        process_all=args.process_all,
     )
 
