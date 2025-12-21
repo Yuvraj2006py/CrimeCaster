@@ -24,6 +24,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
 FROM python:3.11-slim
 
 # Install runtime dependencies for PostGIS
+# Using dev packages which include runtime libraries (works across Debian versions)
 RUN apt-get update && apt-get install -y \
     libpq5 \
     libgdal-dev \

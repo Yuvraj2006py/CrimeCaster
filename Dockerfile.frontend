@@ -13,6 +13,13 @@ COPY frontend/ ./
 # Build the application
 RUN npm run build
 
+# Verify standalone output was created
+RUN echo "=== Verifying standalone output ===" && \
+    ls -la /app/.next/ 2>&1 | head -10 && \
+    test -d /app/.next/standalone && echo "✓ standalone directory exists" || echo "✗ standalone directory NOT found" && \
+    (test -f /app/.next/standalone/server.js && echo "✓ server.js found in standalone" || echo "✗ server.js NOT in standalone") && \
+    ls -la /app/.next/standalone/ 2>&1 | head -15
+
 # Production stage
 FROM node:18-alpine AS runner
 
@@ -25,7 +32,8 @@ RUN addgroup --system --gid 1001 nodejs && \
     adduser --system --uid 1001 nextjs
 
 # Copy built application
-# Next.js standalone output: server.js is directly in .next/standalone/
+# Next.js standalone output: Copy individual files from standalone directory
+# This explicit approach ensures server.js and all dependencies are in the right place
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone/server.js ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone/package.json ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone/node_modules ./node_modules/
@@ -41,6 +49,6 @@ EXPOSE 3000
 ENV PORT=3000
 ENV HOSTNAME="0.0.0.0"
 
-# Use the server.js from standalone directory
+# Run server.js from root (copied from standalone directory)
 CMD ["node", "server.js"]
 
