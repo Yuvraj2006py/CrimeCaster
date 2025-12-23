@@ -14,7 +14,7 @@ TORONTO_CKAN_API = f"{TORONTO_OPEN_DATA_BASE}/api/3/action"
 TORONTO_DATASETS: Dict[str, Dict[str, Optional[str]]] = {
     "major-crime-indicators": {
         "name": "Major Crime Indicators",
-        "resource_id": "6f0a0e0e-8c0a-4b3a-9f3a-1e8b3a4f5e6b",  # Known resource ID
+        "resource_id": None,  # Auto-discover via CKAN API (old resource ID was outdated)
         "filename": "major-crime-indicators.csv",
         "description": "Major crime indicators from Toronto Police Service",
     },
@@ -65,6 +65,12 @@ TORONTO_DATASETS: Dict[str, Dict[str, Optional[str]]] = {
         "resource_id": None,
         "filename": "shootings-firearm-discharges.csv",
         "description": "Shootings and firearm discharge incidents",
+    },
+    "neighbourhood-crime-rates": {
+        "name": "Neighbourhood Crime Rates",
+        "resource_id": None,
+        "filename": "neighbourhood-crime-rates.csv",
+        "description": "Neighbourhood crime rates data",
     },
 }
 

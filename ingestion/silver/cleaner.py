@@ -12,8 +12,9 @@ Cleans raw CSV data from Bronze layer:
 import os
 import sys
 from pathlib import Path
-from datetime import datetime, time
-from typing import Optional, Tuple
+from datetime import datetime, time, timedelta
+from typing import Optional, Tuple, Dict
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import pandas as pd
 from loguru import logger
 from dotenv import load_dotenv
@@ -58,19 +59,42 @@ def find_latest_bronze_file(raw_dir: Path) -> Optional[Path]:
     return latest
 
 
-def find_all_bronze_files(raw_dir: Path) -> list[Path]:
-    """Find all CSV files in raw directory."""
+def find_all_bronze_files(raw_dir: Path, only_recent: bool = True) -> list[Path]:
+    """
+    Find all CSV files in raw directory, excluding test files.
+    
+    Args:
+        raw_dir: Directory containing Bronze CSV files
+        only_recent: If True, only return files from the last 24 hours (to avoid processing old files)
+        
+    Returns:
+        List of CSV file paths, sorted by modification time (newest first)
+    """
     csv_files = list(raw_dir.glob("*.csv"))
-    # Sort by modification time (oldest first for consistent processing)
-    return sorted(csv_files, key=lambda p: p.stat().st_mtime)
+    
+    # Exclude test files (files starting with "test_")
+    csv_files = [f for f in csv_files if not f.name.startswith("test_")]
+    
+    if only_recent:
+        # Only process files modified in the last 24 hours
+        cutoff_time = datetime.now() - timedelta(hours=24)
+        csv_files = [
+            f for f in csv_files 
+            if datetime.fromtimestamp(f.stat().st_mtime) > cutoff_time
+        ]
+        if csv_files:
+            logger.info(f"Found {len(csv_files)} recent Bronze files (last 24 hours, excluding test files)")
+    
+    # Sort by modification time (newest first)
+    return sorted(csv_files, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
 def load_bronze_csv(csv_path: Path, chunk_size: Optional[int] = None) -> pd.DataFrame:
     """
-    Load CSV from Bronze layer.
+    Load CSV or Excel file from Bronze layer.
     
     Args:
-        csv_path: Path to CSV file
+        csv_path: Path to CSV/Excel file
         chunk_size: If provided, process in chunks (for large files)
         
     Returns:
@@ -79,7 +103,31 @@ def load_bronze_csv(csv_path: Path, chunk_size: Optional[int] = None) -> pd.Data
     try:
         logger.info(f"Loading CSV from Bronze layer: {csv_path.name}")
         
-        # Try different encodings
+        # Check if file is Excel (.xlsx or .xls)
+        is_excel = csv_path.suffix.lower() in ['.xlsx', '.xls']
+        
+        # Also check magic bytes for Excel files (PK\x03\x04)
+        if not is_excel:
+            try:
+                with open(csv_path, 'rb') as f:
+                    magic_bytes = f.read(4)
+                    if magic_bytes == b'PK\x03\x04':
+                        is_excel = True
+            except Exception:
+                pass
+        
+        if is_excel:
+            # Load Excel file
+            try:
+                df = pd.read_excel(csv_path, engine='openpyxl')
+                logger.info(f"Successfully loaded Excel file with openpyxl")
+                logger.info(f"Loaded {len(df):,} rows, {len(df.columns)} columns")
+                return df
+            except Exception as e:
+                logger.error(f"Error loading Excel file: {e}")
+                raise
+        
+        # Try different encodings for CSV files
         encodings = ["utf-8", "latin-1", "iso-8859-1", "cp1252"]
         df = None
         
@@ -106,6 +154,20 @@ def load_bronze_csv(csv_path: Path, chunk_size: Optional[int] = None) -> pd.Data
                 break
             except UnicodeDecodeError:
                 continue
+            except pd.errors.ParserError as e:
+                # If CSV parsing fails, try with more lenient settings
+                logger.warning(f"CSV parsing error with {encoding}, trying fallback method: {e}")
+                try:
+                    df = pd.read_csv(
+                        csv_path,
+                        encoding=encoding,
+                        on_bad_lines='skip',
+                        engine='python',
+                    )
+                    logger.info(f"Successfully loaded CSV with fallback method (encoding: {encoding})")
+                    break
+                except Exception:
+                    continue
         
         if df is None:
             raise ValueError("Failed to load CSV with any encoding")
@@ -118,52 +180,110 @@ def load_bronze_csv(csv_path: Path, chunk_size: Optional[int] = None) -> pd.Data
         raise
 
 
-def validate_and_clean_coordinates(df: pd.DataFrame) -> pd.DataFrame:
+def build_column_mapping(df: pd.DataFrame) -> Dict[str, Optional[str]]:
     """
-    Validate and clean coordinate data.
+    Build column mapping once instead of searching multiple times.
     
     Args:
-        df: DataFrame with LAT_WGS84 and LONG_WGS84 columns
+        df: DataFrame to map columns from
         
     Returns:
-        DataFrame with invalid coordinates removed
+        Dict mapping target -> column_name (or None if not found)
+    """
+    col_upper_map = {col.upper(): col for col in df.columns}
+    col_upper_list = list(col_upper_map.keys())
+    
+    mapping = {}
+    
+    # Find all columns we need in one pass
+    for target, patterns in [
+        ('date', ['OCC_DATE', 'OCC', 'DATE']),
+        ('hour', ['OCC_HOUR', 'OCC', 'HOUR']),
+        ('lat', ['LAT_WGS84', 'LAT', 'LATITUDE']),
+        ('lon', ['LONG_WGS84', 'LONG', 'LONGITUDE', 'LON']),
+        ('crime', ['MCI_CATEGORY', 'CRIME_TYPE', 'MAJOR_CRIME_INDICATOR', 'EVENT_TYPE']),
+        ('neighbourhood', ['NEIGHBOURHOOD', 'NEIGHBORHOOD']),
+        ('premise', ['PREMISES_TYPE', 'PREMISE_TYPE']),
+        ('unique_id', ['EVENT_UNIQUE_ID', 'UNIQUE_ID', 'ID']),
+    ]:
+        found = False
+        for pattern in patterns:
+            # Try exact match first
+            if pattern in col_upper_map:
+                mapping[target] = col_upper_map[pattern]
+                found = True
+                break
+            # Try substring match (for columns like NEIGHBOURHOOD_158)
+            for col_upper in col_upper_list:
+                if pattern in col_upper:
+                    mapping[target] = col_upper_map[col_upper]
+                    found = True
+                    break
+            if found:
+                break
+        
+        if not found:
+            mapping[target] = None
+    
+    return mapping
+
+
+def validate_coordinates_vectorized(df: pd.DataFrame, lat_col: str, lon_col: str) -> pd.Series:
+    """
+    Vectorized coordinate validation (single pass, optimized).
+    
+    Args:
+        df: DataFrame with coordinate columns
+        lat_col: Latitude column name
+        lon_col: Longitude column name
+        
+    Returns:
+        Boolean Series indicating valid coordinates
+    """
+    # Convert to numeric once
+    lats = pd.to_numeric(df[lat_col], errors='coerce')
+    lons = pd.to_numeric(df[lon_col], errors='coerce')
+    
+    # Single vectorized mask (faster than multiple operations)
+    valid_mask = (
+        lats.between(TORONTO_LAT_MIN, TORONTO_LAT_MAX) &
+        lons.between(TORONTO_LON_MIN, TORONTO_LON_MAX) &
+        lats.notna() &
+        lons.notna()
+    )
+    
+    return valid_mask
+
+
+def validate_and_clean_coordinates(df: pd.DataFrame, col_map: Optional[Dict[str, Optional[str]]] = None) -> Optional[pd.DataFrame]:
+    """
+    Validate and clean coordinate data (optimized with column mapping).
+    
+    Args:
+        df: DataFrame with coordinate columns
+        col_map: Optional pre-built column mapping (for performance)
+        
+    Returns:
+        DataFrame with invalid coordinates removed, or None if columns not found
     """
     initial_count = len(df)
     
-    # Check for required columns
-    lat_col = None
-    lon_col = None
+    # Use provided mapping or build one
+    if col_map is None:
+        col_map = build_column_mapping(df)
     
-    for col in df.columns:
-        if col.upper() in ["LAT_WGS84", "LAT", "LATITUDE"]:
-            lat_col = col
-        if col.upper() in ["LONG_WGS84", "LONG", "LONGITUDE", "LON"]:
-            lon_col = col
+    lat_col = col_map.get('lat')
+    lon_col = col_map.get('lon')
     
     if not lat_col or not lon_col:
-        raise ValueError(f"Coordinate columns not found. Found: {list(df.columns)}")
+        return None
     
-    # Convert to numeric, coerce errors to NaN
-    df[lat_col] = pd.to_numeric(df[lat_col], errors="coerce")
-    df[lon_col] = pd.to_numeric(df[lon_col], errors="coerce")
-    
-    # Filter valid Toronto coordinates
-    valid_mask = (
-        (df[lat_col] >= TORONTO_LAT_MIN)
-        & (df[lat_col] <= TORONTO_LAT_MAX)
-        & (df[lon_col] >= TORONTO_LON_MIN)
-        & (df[lon_col] <= TORONTO_LON_MAX)
-        & df[lat_col].notna()
-        & df[lon_col].notna()
-    )
+    # Vectorized validation
+    valid_mask = validate_coordinates_vectorized(df, lat_col, lon_col)
     
     invalid_count = (~valid_mask).sum()
     if invalid_count > 0:
         logger.warning(f"Removing {invalid_count:,} rows with invalid coordinates")
-        logger.info(
-            f"Coordinate bounds: lat [{TORONTO_LAT_MIN}, {TORONTO_LAT_MAX}], "
-            f"lon [{TORONTO_LON_MIN}, {TORONTO_LON_MAX}]"
-        )
     
     df_clean = df[valid_mask].copy()
     removed = initial_count - len(df_clean)
@@ -174,26 +294,19 @@ def validate_and_clean_coordinates(df: pd.DataFrame) -> pd.DataFrame:
     return df_clean
 
 
-def parse_datetime(df: pd.DataFrame) -> pd.Series:
+def parse_datetime_fast(df: pd.DataFrame, col_map: Dict[str, Optional[str]]) -> pd.Series:
     """
-    Parse occurrence datetime from OCC_DATE and OCC_HOUR.
+    Parse occurrence datetime from date and hour columns (optimized with column mapping).
     
     Args:
-        df: DataFrame with OCC_DATE and OCC_HOUR columns
+        df: DataFrame with date and hour columns
+        col_map: Pre-built column mapping
         
     Returns:
         Series with datetime objects
     """
-    # Find date and hour columns
-    date_col = None
-    hour_col = None
-    
-    for col in df.columns:
-        col_upper = col.upper()
-        if "OCC_DATE" in col_upper or ("OCC" in col_upper and "DATE" in col_upper):
-            date_col = col
-        if "OCC_HOUR" in col_upper or ("OCC" in col_upper and "HOUR" in col_upper):
-            hour_col = col
+    date_col = col_map.get('date')
+    hour_col = col_map.get('hour')
     
     if not date_col:
         raise ValueError(f"Date column not found. Available: {list(df.columns)}")
@@ -222,44 +335,27 @@ def parse_datetime(df: pd.DataFrame) -> pd.Series:
     return datetimes
 
 
-def standardize_crime_types(df: pd.DataFrame) -> pd.Series:
+def standardize_crime_types_fast(df: pd.DataFrame, crime_col: str) -> pd.Series:
     """
-    Standardize crime type names.
-    
-    Uses MCI_CATEGORY (high-level category) rather than detailed OFFENCE.
+    Optimized crime type standardization using vectorized operations.
     
     Args:
-        df: DataFrame with MCI_CATEGORY column
+        df: DataFrame with crime type column
+        crime_col: Name of crime type column
         
     Returns:
         Series with standardized crime types
     """
-    # Find crime type column - prefer MCI_CATEGORY over OFFENCE
-    crime_col = None
-    for col in df.columns:
-        if col.upper() == "MCI_CATEGORY":
-            crime_col = col
-            break
-    
-    # Fallback to other columns if MCI_CATEGORY not found
     if not crime_col:
-        for col in df.columns:
-            if col.upper() in ["CRIME_TYPE", "MAJOR_CRIME_INDICATOR"]:
-                crime_col = col
-                break
-    
-    if not crime_col:
-        raise ValueError(f"Crime type column (MCI_CATEGORY) not found. Available: {list(df.columns)}")
+        raise ValueError(f"Crime type column not found. Available: {list(df.columns)}")
     
     crime_types = df[crime_col].astype(str).str.strip()
     
     # Standardize common variations to match expected categories
-    # Map to exact expected values (case-sensitive)
     replacements = {
         "break and enter": "Break and Enter",
         "break & enter": "Break and Enter",
         "b&e": "Break and Enter",
-        "break and enter": "Break and Enter",  # Already correct
         "auto theft": "Auto Theft",
         "theft over": "Theft Over",
         "theftover": "Theft Over",
@@ -267,16 +363,14 @@ def standardize_crime_types(df: pd.DataFrame) -> pd.Series:
         "robbery": "Robbery",
     }
     
-    # Normalize to lowercase first for matching
+    # Use map for vectorized replacement (much faster than multiple .str operations)
     crime_types_lower = crime_types.str.lower().str.strip()
+    crime_types = crime_types_lower.map(replacements).fillna(crime_types)
     
-    # Apply replacements
-    for old, new in replacements.items():
-        crime_types = crime_types.where(crime_types_lower != old.lower(), new)
-    
-    # For any remaining, use title case but fix "and" to lowercase
-    crime_types = crime_types.str.title()
-    crime_types = crime_types.str.replace(" And ", " and ", regex=False)
+    # Title case only unmatched values (optimization)
+    mask = ~crime_types.isin(replacements.values())
+    if mask.any():
+        crime_types.loc[mask] = crime_types.loc[mask].str.title().str.replace(" And ", " and ", regex=False)
     
     # Ensure we have valid categories
     valid_categories = ["Assault", "Robbery", "Break and Enter", "Auto Theft", "Theft Over"]
@@ -287,87 +381,93 @@ def standardize_crime_types(df: pd.DataFrame) -> pd.Series:
     return crime_types
 
 
-def clean_neighbourhood(df: pd.DataFrame) -> pd.Series:
+def clean_neighbourhood_fast(df: pd.DataFrame, hood_col: Optional[str]) -> pd.Series:
     """
-    Clean and standardize neighbourhood names.
+    Optimized neighbourhood cleaning (with pre-mapped column).
     
     Args:
         df: DataFrame with neighbourhood column
+        hood_col: Name of neighbourhood column (or None)
         
     Returns:
         Series with cleaned neighbourhood names
     """
-    # Try to find neighbourhood column
-    hood_col = None
-    for col in df.columns:
-        if "NEIGHBOURHOOD" in col.upper() or "NEIGHBORHOOD" in col.upper():
-            hood_col = col
-            break
-    
     if not hood_col:
-        logger.warning("Neighbourhood column not found, returning empty series")
-        return pd.Series([None] * len(df))
+        return pd.Series([None] * len(df), index=df.index)
     
     neighbourhoods = df[hood_col].astype(str).str.strip()
     
-    # Remove common prefixes/suffixes
-    neighbourhoods = neighbourhoods.str.replace(r"^\d+\s*", "", regex=True)  # Remove leading numbers
-    neighbourhoods = neighbourhoods.str.replace(r"\s*\(\d+\)$", "", regex=True)  # Remove trailing (number)
-    
-    # Replace empty strings with None
-    neighbourhoods = neighbourhoods.replace("", None).replace("nan", None)
+    # Chain operations for efficiency
+    neighbourhoods = (
+        neighbourhoods
+        .str.replace(r"^\d+\s*", "", regex=True)  # Remove leading numbers
+        .str.replace(r"\s*\(\d+\)$", "", regex=True)  # Remove trailing (number)
+        .replace("", None)
+        .replace("nan", None)
+    )
     
     return neighbourhoods
 
 
-def clean_premise_type(df: pd.DataFrame) -> pd.Series:
+def clean_premise_type_fast(df: pd.DataFrame, premise_col: Optional[str]) -> pd.Series:
     """
-    Clean and standardize premise type.
+    Optimized premise type cleaning (with pre-mapped column).
     
     Args:
-        df: DataFrame with PREMISES_TYPE column
+        df: DataFrame with premise type column
+        premise_col: Name of premise type column (or None)
         
     Returns:
         Series with cleaned premise types
     """
-    # Find premise type column
-    premise_col = None
-    for col in df.columns:
-        if "PREMISES_TYPE" in col.upper() or "PREMISE_TYPE" in col.upper():
-            premise_col = col
-            break
-    
     if not premise_col:
-        logger.warning("Premise type column not found, returning empty series")
-        return pd.Series([None] * len(df))
+        return pd.Series([None] * len(df), index=df.index)
     
     premise_types = df[premise_col].astype(str).str.strip()
-    
-    # Standardize common values
     premise_types = premise_types.replace("", None).replace("nan", None)
     
     return premise_types
 
 
-def remove_duplicates(df: pd.DataFrame, unique_id_col: str = "EVENT_UNIQUE_ID") -> pd.DataFrame:
+def remove_duplicates_fast(df: pd.DataFrame, unique_id_col: Optional[str] = None) -> pd.DataFrame:
     """
-    Remove duplicate records.
+    Fast duplicate removal using hash-based approach for large files.
     
     Args:
         df: DataFrame to deduplicate
-        unique_id_col: Column name for unique identifier
+        unique_id_col: Column name for unique identifier (or None to auto-detect)
         
     Returns:
         DataFrame with duplicates removed
     """
     initial_count = len(df)
     
-    if unique_id_col not in df.columns:
-        logger.warning(f"Unique ID column '{unique_id_col}' not found, using all columns for deduplication")
-        df_clean = df.drop_duplicates()
+    # Auto-detect unique ID column if not provided
+    if unique_id_col is None:
+        for col in df.columns:
+            if col.upper() in ["EVENT_UNIQUE_ID", "UNIQUE_ID", "ID"]:
+                unique_id_col = col
+                break
+    
+    if unique_id_col and unique_id_col in df.columns:
+        # For very large DataFrames, use hash-based approach (O(n) vs O(n log n))
+        if len(df) > 100000:
+            # Use hash set for O(n) duplicate removal
+            seen = set()
+            mask = []
+            for val in df[unique_id_col]:
+                if val not in seen:
+                    seen.add(val)
+                    mask.append(True)
+                else:
+                    mask.append(False)
+            df_clean = df[mask].copy()
+        else:
+            # For smaller DataFrames, use pandas drop_duplicates (optimized)
+            df_clean = df.drop_duplicates(subset=[unique_id_col], keep="first")
     else:
-        # Remove duplicates based on unique ID
-        df_clean = df.drop_duplicates(subset=[unique_id_col], keep="first")
+        logger.warning(f"Unique ID column not found, using all columns for deduplication")
+        df_clean = df.drop_duplicates(keep="first")
     
     removed = initial_count - len(df_clean)
     if removed > 0:
@@ -412,34 +512,26 @@ def extract_dataset_type_from_filename(filename: str) -> Optional[str]:
     
     logger.warning(f"Could not extract dataset_type from filename: {filename}")
     return None
-    return None
 
 
-def transform_to_schema(df: pd.DataFrame, source_file: str) -> pd.DataFrame:
+def transform_to_schema_flexible(df: pd.DataFrame, source_file: str) -> pd.DataFrame:
     """
-    Transform cleaned data to match target schema.
+    Transform data to flexible schema that works with or without coordinates.
+    
+    For datasets with coordinates: Uses standard schema with lat/lon
+    For datasets without coordinates: Preserves all original columns
     
     Args:
         df: Cleaned DataFrame from Bronze layer
         source_file: Original CSV filename
         
     Returns:
-        DataFrame with schema columns
+        DataFrame with flexible schema
     """
-    logger.info("Transforming data to target schema...")
+    logger.info("Transforming data to flexible schema...")
     
-    # Find coordinate columns
-    lat_col = None
-    lon_col = None
-    for col in df.columns:
-        col_upper = col.upper()
-        if col_upper in ["LAT_WGS84", "LAT", "LATITUDE"]:
-            lat_col = col
-        if col_upper in ["LONG_WGS84", "LONG", "LONGITUDE", "LON"]:
-            lon_col = col
-    
-    if not lat_col or not lon_col:
-        raise ValueError("Coordinate columns not found")
+    # Build column mapping once
+    col_map = build_column_mapping(df)
     
     # Extract dataset_type from filename
     dataset_type = extract_dataset_type_from_filename(source_file)
@@ -448,62 +540,202 @@ def transform_to_schema(df: pd.DataFrame, source_file: str) -> pd.DataFrame:
     else:
         logger.warning(f"Could not extract dataset_type from filename: {source_file}")
     
+    # Check if we have coordinates
+    has_coordinates = col_map.get('lat') and col_map.get('lon')
+    has_date = col_map.get('date')
+    has_crime = col_map.get('crime')
+    
     # Create transformed DataFrame
-    transformed = pd.DataFrame()
+    transformed = pd.DataFrame(index=df.index)
     
-    # Parse datetime
-    transformed["occurred_at"] = parse_datetime(df)
-    
-    # Coordinates
-    transformed["latitude"] = pd.to_numeric(df[lat_col], errors="coerce")
-    transformed["longitude"] = pd.to_numeric(df[lon_col], errors="coerce")
-    
-    # Crime type
-    transformed["crime_type"] = standardize_crime_types(df)
-    
-    # Neighbourhood
-    transformed["neighbourhood"] = clean_neighbourhood(df)
-    
-    # Premise type
-    transformed["premise_type"] = clean_premise_type(df)
-    
-    # Source file
+    # Always add metadata columns
     transformed["source_file"] = source_file
+    transformed["dataset_type"] = dataset_type
+    # Set has_coordinates as a boolean Series (not scalar) to preserve type in CSV
+    transformed["has_coordinates"] = pd.Series([has_coordinates] * len(df), index=df.index, dtype=bool)
     
-    # Dataset type (extracted from filename)
+    # Handle date column
+    if has_date:
+        transformed["occurred_at"] = parse_datetime_fast(df, col_map)
+    else:
+        # Try to find any date-like column
+        date_cols = [col for col in df.columns if 'date' in col.lower() or 'time' in col.lower() or 'year' in col.lower()]
+        if date_cols:
+            try:
+                transformed["occurred_at"] = pd.to_datetime(df[date_cols[0]], errors="coerce")
+                logger.info(f"Using date column: {date_cols[0]}")
+            except:
+                transformed["occurred_at"] = None
+        else:
+            transformed["occurred_at"] = None
+            logger.warning("No date column found, setting occurred_at to None")
+    
+    if has_coordinates:
+        # Standard schema with coordinates
+        transformed["latitude"] = pd.to_numeric(df[col_map['lat']], errors="coerce")
+        transformed["longitude"] = pd.to_numeric(df[col_map['lon']], errors="coerce")
+        
+        if has_crime:
+            transformed["crime_type"] = standardize_crime_types_fast(df, col_map['crime'])
+        else:
+            transformed["crime_type"] = None
+        
+        transformed["neighbourhood"] = clean_neighbourhood_fast(df, col_map.get('neighbourhood'))
+        transformed["premise_type"] = clean_premise_type_fast(df, col_map.get('premise'))
+        
+        # Filter invalid coordinates
+        valid_mask = (
+            transformed["occurred_at"].notna() &
+            transformed["latitude"].notna() &
+            transformed["longitude"].notna() &
+            transformed["latitude"].between(TORONTO_LAT_MIN, TORONTO_LAT_MAX) &
+            transformed["longitude"].between(TORONTO_LON_MIN, TORONTO_LON_MAX)
+        )
+        
+        if has_crime:
+            valid_mask = valid_mask & transformed["crime_type"].notna()
+        
+        invalid_count = (~valid_mask).sum()
+        if invalid_count > 0:
+            logger.warning(f"Removing {invalid_count:,} rows with invalid/missing critical fields")
+            transformed = transformed[valid_mask].copy()
+    else:
+        # No coordinates - preserve all original data
+        logger.info("No coordinates found - preserving all original columns for aggregate data")
+        transformed["latitude"] = None
+        transformed["longitude"] = None
+        transformed["crime_type"] = None
+        transformed["neighbourhood"] = None
+        transformed["premise_type"] = None
+        
+        # Preserve all original columns (for aggregate datasets) - use concat for performance
+        raw_cols = {}
+        for col in df.columns:
+            if col not in transformed.columns:
+                # Store original columns with 'raw_' prefix to avoid conflicts
+                raw_cols[f"raw_{col}"] = df[col]
+        
+        # Add all raw columns at once using concat (avoids DataFrame fragmentation)
+        if raw_cols:
+            raw_df = pd.DataFrame(raw_cols, index=df.index)
+            transformed = pd.concat([transformed, raw_df], axis=1)
+    
+    logger.info(f"Transformed to {len(transformed):,} rows")
+    
+    return transformed
+
+
+def transform_to_schema_single_pass(df: pd.DataFrame, source_file: str) -> pd.DataFrame:
+    """
+    Transform cleaned data to match target schema in a single pass (optimized).
+    
+    All transformations are combined to minimize data passes and memory copies.
+    
+    Args:
+        df: Cleaned DataFrame from Bronze layer
+        source_file: Original CSV filename
+        
+    Returns:
+        DataFrame with schema columns
+    """
+    logger.info("Transforming data to target schema (single-pass optimization)...")
+    
+    # Build column mapping once
+    col_map = build_column_mapping(df)
+    
+    # Validate we have required columns
+    if not col_map.get('lat') or not col_map.get('lon'):
+        raise ValueError("Coordinate columns not found")
+    
+    if not col_map.get('date'):
+        raise ValueError("Date column not found")
+    
+    if not col_map.get('crime'):
+        raise ValueError("Crime type column not found")
+    
+    # Extract dataset_type from filename
+    dataset_type = extract_dataset_type_from_filename(source_file)
+    if dataset_type:
+        logger.info(f"Extracted dataset_type: {dataset_type}")
+    else:
+        logger.warning(f"Could not extract dataset_type from filename: {source_file}")
+    
+    # Create transformed DataFrame with all operations in parallel (single pass)
+    transformed = pd.DataFrame(index=df.index)
+    
+    # All transformations in parallel (vectorized)
+    transformed["occurred_at"] = parse_datetime_fast(df, col_map)
+    transformed["latitude"] = pd.to_numeric(df[col_map['lat']], errors="coerce")
+    transformed["longitude"] = pd.to_numeric(df[col_map['lon']], errors="coerce")
+    transformed["crime_type"] = standardize_crime_types_fast(df, col_map['crime'])
+    transformed["neighbourhood"] = clean_neighbourhood_fast(df, col_map.get('neighbourhood'))
+    transformed["premise_type"] = clean_premise_type_fast(df, col_map.get('premise'))
+    transformed["source_file"] = source_file
     transformed["dataset_type"] = dataset_type
     
-    # Remove rows with missing critical fields
-    critical_mask = (
-        transformed["occurred_at"].notna()
-        & transformed["latitude"].notna()
-        & transformed["longitude"].notna()
-        & transformed["crime_type"].notna()
+    # Filter invalid rows in one pass (combine coordinate validation and critical fields)
+    valid_mask = (
+        transformed["occurred_at"].notna() &
+        transformed["latitude"].notna() &
+        transformed["longitude"].notna() &
+        transformed["crime_type"].notna() &
+        transformed["latitude"].between(TORONTO_LAT_MIN, TORONTO_LAT_MAX) &
+        transformed["longitude"].between(TORONTO_LON_MIN, TORONTO_LON_MAX)
     )
     
-    invalid_count = (~critical_mask).sum()
+    invalid_count = (~valid_mask).sum()
     if invalid_count > 0:
-        logger.warning(f"Removing {invalid_count:,} rows with missing critical fields")
-        transformed = transformed[critical_mask].copy()
+        logger.warning(f"Removing {invalid_count:,} rows with invalid/missing critical fields")
+        transformed = transformed[valid_mask].copy()
     
     logger.info(f"Transformed to {len(transformed):,} valid rows")
     
     return transformed
 
 
-def save_silver_data(df: pd.DataFrame, output_path: Path):
+def transform_to_schema(df: pd.DataFrame, source_file: str) -> pd.DataFrame:
     """
-    Save cleaned data to Silver layer.
+    Transform cleaned data to match target schema (wrapper for backward compatibility).
+    
+    Args:
+        df: Cleaned DataFrame from Bronze layer
+        source_file: Original CSV filename
+        
+    Returns:
+        DataFrame with schema columns
+    """
+    return transform_to_schema_single_pass(df, source_file)
+
+
+def save_silver_data(df: pd.DataFrame, output_path: Path, use_compression: bool = True):
+    """
+    Save cleaned data to Silver layer with optimized writing.
     
     Args:
         df: Cleaned DataFrame
         output_path: Path to save cleaned CSV
+        use_compression: If True, use gzip compression for faster I/O
     """
     try:
         logger.info(f"Saving cleaned data to: {output_path}")
-        df.to_csv(output_path, index=False)
-        file_size = output_path.stat().st_size / (1024 * 1024)  # MB
-        logger.info(f"Saved {len(df):,} rows ({file_size:.2f} MB)")
+        
+        if use_compression and len(df) > 10000:
+            # Use compressed CSV for large files (faster I/O, smaller files)
+            output_path_compressed = output_path.with_suffix('.csv.gz')
+            df.to_csv(
+                output_path_compressed,
+                index=False,
+                compression='gzip',
+            )
+            file_size = output_path_compressed.stat().st_size / (1024 * 1024)  # MB
+            logger.info(f"Saved {len(df):,} rows ({file_size:.2f} MB compressed)")
+            # Also save uncompressed version for compatibility
+            df.to_csv(output_path, index=False)
+        else:
+            # Standard CSV for smaller files
+            df.to_csv(output_path, index=False)
+            file_size = output_path.stat().st_size / (1024 * 1024)  # MB
+            logger.info(f"Saved {len(df):,} rows ({file_size:.2f} MB)")
     except Exception as e:
         logger.error(f"Error saving cleaned data: {e}")
         raise
@@ -515,7 +747,7 @@ def process_single_file(
     skip_validation: bool = False,
 ) -> bool:
     """
-    Process a single Bronze CSV file through Silver layer.
+    Process a single Bronze CSV file through Silver layer (optimized).
     
     Args:
         csv_path: Path to Bronze CSV file
@@ -540,37 +772,45 @@ def process_single_file(
     initial_count = len(df)
     logger.info(f"Starting with {initial_count:,} rows")
     
-    # Step 1: Remove duplicates
+    # Step 1: Remove duplicates (optimized)
     logger.info("Step 1: Removing duplicates...")
-    df = remove_duplicates(df)
+    df = remove_duplicates_fast(df)
     
-    # Step 2: Validate and clean coordinates
-    if not skip_validation:
-        logger.info("Step 2: Validating coordinates...")
-        df = validate_and_clean_coordinates(df)
-    else:
-        logger.warning("Skipping coordinate validation (not recommended)")
+    # Step 2: Build column mapping once (optimization)
+    col_map = build_column_mapping(df)
     
-    # Step 3: Transform to target schema
-    logger.info("Step 3: Transforming to target schema...")
+    # Step 3: Check if we have coordinates
+    has_coordinates = col_map.get('lat') and col_map.get('lon')
+    
+    if not has_coordinates:
+        logger.info(f"Dataset {csv_path.name} does not have coordinate columns.")
+        logger.info("This appears to be an aggregate/statistical dataset - processing with flexible schema.")
+    
+    # Step 4: Transform to schema (flexible - works with or without coordinates)
+    logger.info("Step 4: Transforming to flexible schema...")
     try:
-        df_clean = transform_to_schema(df, source_file)
+        if has_coordinates:
+            # Use standard transformation for datasets with coordinates
+            df_clean = transform_to_schema_single_pass(df, source_file)
+        else:
+            # Use flexible transformation for datasets without coordinates
+            df_clean = transform_to_schema_flexible(df, source_file)
     except Exception as e:
         logger.error(f"Transformation failed for {csv_path.name}: {e}")
         return False
     
-    # Step 4: Save cleaned data
+    # Step 5: Save cleaned data (optimized)
     if output_file:
         output_path = Path(output_file)
     else:
         # Generate output filename based on source file
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # Extract dataset name from source file (e.g., "major-crime-indicators_20251221_110200.csv" -> "major-crime-indicators")
+        # Extract dataset name from source file
         dataset_name = csv_path.stem.split("_")[0] if "_" in csv_path.stem else csv_path.stem
         output_path = silver_dir / f"cleaned_{dataset_name}_{timestamp}.csv"
     
     try:
-        save_silver_data(df_clean, output_path)
+        save_silver_data(df_clean, output_path, use_compression=True)
     except Exception as e:
         logger.error(f"Failed to save cleaned data for {csv_path.name}: {e}")
         return False
@@ -612,28 +852,40 @@ def main(
     
     # Process all files if requested
     if process_all:
-        csv_files = find_all_bronze_files(raw_dir)
+        csv_files = find_all_bronze_files(raw_dir, only_recent=True)
         if not csv_files:
-            logger.error(f"No CSV files found in {raw_dir}")
+            logger.error(f"No recent CSV files found in {raw_dir} (last 24 hours)")
+            logger.info("Tip: If you want to process older files, modify find_all_bronze_files() or use --input to specify files")
             sys.exit(1)
         
-        logger.info(f"Processing {len(csv_files)} Bronze files...")
+        logger.info(f"Processing {len(csv_files)} Bronze files in parallel...")
         logger.info("")
         
-        success_count = 0
-        failed_count = 0
+        # Process files in parallel (optimization)
+        max_workers = min(4, len(csv_files))  # Use up to 4 workers
+        results = {}
         
-        for csv_path in csv_files:
-            logger.info("")
-            logger.info("=" * 60)
-            logger.info(f"Processing file {csv_files.index(csv_path) + 1}/{len(csv_files)}")
-            logger.info("=" * 60)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(process_single_file, csv_path, skip_validation=skip_validation): csv_path
+                for csv_path in csv_files
+            }
             
-            if process_single_file(csv_path, skip_validation=skip_validation):
-                success_count += 1
-            else:
-                failed_count += 1
-                logger.warning(f"Failed to process {csv_path.name}")
+            for i, future in enumerate(as_completed(futures), 1):
+                csv_path = futures[future]
+                try:
+                    success = future.result()
+                    results[csv_path] = success
+                    if success:
+                        logger.success(f"✓ [{i}/{len(csv_files)}] Processed: {csv_path.name}")
+                    else:
+                        logger.error(f"✗ [{i}/{len(csv_files)}] Failed: {csv_path.name}")
+                except Exception as e:
+                    logger.error(f"✗ [{i}/{len(csv_files)}] Exception processing {csv_path.name}: {e}")
+                    results[csv_path] = False
+        
+        success_count = sum(1 for v in results.values() if v)
+        failed_count = len(results) - success_count
         
         logger.info("")
         logger.info("=" * 60)

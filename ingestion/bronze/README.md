@@ -5,7 +5,7 @@ Supports multiple datasets with automatic CKAN API discovery and parallel downlo
 
 ## Supported Datasets
 
-The Bronze layer supports 9 Toronto Open Data datasets:
+The Bronze layer supports 10 Toronto Open Data datasets:
 
 1. **major-crime-indicators** - Major Crime Indicators (pre-configured)
 2. **police-annual-statistical-report-shooting-occurrences** - Shooting Occurrences
@@ -16,6 +16,7 @@ The Bronze layer supports 9 Toronto Open Data datasets:
 7. **police-annual-statistical-report-miscellaneous-firearms** - Miscellaneous Firearms
 8. **theft-from-motor-vehicle** - Theft from Motor Vehicle
 9. **shootings-firearm-discharges** - Shootings and Firearm Discharges
+10. **neighbourhood-crime-rates** - Neighbourhood Crime Rates
 
 Resource IDs are automatically discovered via CKAN API if not pre-configured.
 

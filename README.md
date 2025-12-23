@@ -8,6 +8,7 @@ Crime Caster ingests public Toronto crime data, engineers spatiotemporal feature
 
 **Key Features:**
 - Batch data pipeline (Bronze → Silver → Gold layers)
+- **Local Parquet storage** for unlimited ML training data
 - Spatial indexing using Uber H3 hexagons
 - Temporal feature engineering
 - ML model training and versioning
@@ -25,17 +26,28 @@ Crime Caster ingests public Toronto crime data, engineers spatiotemporal feature
 ## 🏗️ Architecture
 
 ```
-Toronto Open Data CSV → Bronze Layer → Silver Layer → Gold Layer → PostgreSQL (Supabase)
-                                                                    ↓
-Feature Engineering → ML Training → Model Artifacts → FastAPI → React 3D Map
+Toronto Open Data CSV → Bronze Layer → Silver Layer → Gold Layer
+                                                          ↓
+                    ┌─────────────────────────────────────┴─────────────────────┐
+                    ↓                                                           ↓
+            Parquet Files (local)                                    PostgreSQL (Neon, optional)
+                    ↓                                                           ↓
+            ML Training (unlimited)                                API Serving (limited)
+                    ↓                                                           ↓
+            Model Artifacts → FastAPI → React 3D Map
 ```
+
+**Storage Modes:**
+- **Hybrid (Default)**: Parquet files (unlimited) + Database (for API)
+- **Local-Only**: Parquet files only (perfect for ML training)
+- See [Local Storage Guide](docs/local_storage_guide.md) for details
 
 ## 📋 Prerequisites
 
 - Python 3.11+
 - Node.js 18+
 - Docker & Docker Compose
-- Supabase account (free tier available)
+- Neon account (free tier available) or any PostgreSQL with PostGIS
 - Mapbox account (free tier available)
 
 ## 🚀 Quick Start

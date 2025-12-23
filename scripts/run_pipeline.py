@@ -98,14 +98,29 @@ def run_silver_layer() -> bool:
 
 
 def run_gold_layer() -> bool:
-    """Run Gold layer (H3 mapping and database loading)."""
+    """Run Gold layer (H3 mapping and storage)."""
+    import os
+    from dotenv import load_dotenv
+    
+    load_dotenv()
+    
     logger.info("=" * 80)
-    logger.info("PHASE 3: GOLD LAYER - H3 Mapping & Database Loading")
+    logger.info("PHASE 3: GOLD LAYER - H3 Mapping & Storage")
     logger.info("=" * 80)
+    
+    # Check storage mode
+    load_to_database = os.getenv("LOAD_TO_DATABASE", "true").lower() == "true"
+    if load_to_database:
+        logger.info("📊 Storage mode: Database + Parquet files")
+        logger.info("   Data will be saved to both database and local Parquet files")
+    else:
+        logger.info("💾 Storage mode: Local-only (Parquet files)")
+        logger.info("   Data will be saved to Parquet files only (no database)")
+        logger.info("   Perfect for ML training with unlimited data storage")
     
     try:
         from transformations.gold.h3_mapper import main as gold_main
-        gold_main(process_all=True)  # Process all Silver files
+        gold_main(process_all=True, parallel=True, max_workers=4)  # Process all Silver files in parallel
         logger.success("✅ Gold layer completed successfully")
         return True
     except SystemExit as e:

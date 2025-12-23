@@ -25,6 +25,14 @@ from ingestion.bronze.dataset_config import (
     get_dataset_url,
 )
 
+# Try to import chardet for encoding detection, fallback to manual detection
+try:
+    import chardet
+    HAS_CHARDET = True
+except ImportError:
+    HAS_CHARDET = False
+    logger.warning("chardet not installed. Encoding detection will use fallback method.")
+
 # Load environment variables
 load_dotenv()
 
@@ -337,36 +345,56 @@ def download_single_dataset(
         return None, None
 
 
-def load_csv(file_path: Path) -> Optional[pd.DataFrame]:
+def detect_encoding(file_path: Path) -> str:
     """
-    Load CSV file into pandas DataFrame with robust error handling.
+    Detect file encoding using chardet or fallback method.
+    
+    Args:
+        file_path: Path to file
+        
+    Returns:
+        Detected encoding string
+    """
+    if HAS_CHARDET:
+        try:
+            with open(file_path, 'rb') as f:
+                raw_data = f.read(10000)  # Read first 10KB for detection
+                result = chardet.detect(raw_data)
+                encoding = result.get('encoding', 'utf-8')
+                confidence = result.get('confidence', 0)
+                
+                # If confidence is low, fallback to utf-8
+                if confidence < 0.7:
+                    logger.debug(f"Low encoding confidence ({confidence:.2f}), using utf-8")
+                    return 'utf-8'
+                
+                logger.debug(f"Detected encoding: {encoding} (confidence: {confidence:.2f})")
+                return encoding
+        except Exception as e:
+            logger.warning(f"Encoding detection failed: {e}, using utf-8")
+            return 'utf-8'
+    else:
+        # Fallback: try utf-8 first
+        return 'utf-8'
+
+
+def load_csv(file_path: Path, chunk_size: Optional[int] = None) -> Optional[pd.DataFrame]:
+    """
+    Load CSV file into pandas DataFrame with optimized encoding detection and chunked reading.
     
     Args:
         file_path: Path to CSV file
+        chunk_size: If provided, process in chunks (for large files > 50MB)
         
     Returns:
         DataFrame or None if error
     """
-    # #region agent log
-    import json
-    log_path = Path(".cursor/debug.log")
-    try:
-        with open(log_path, "a", encoding="utf-8") as f:
-            json.dump({
-                "sessionId": "debug-session",
-                "runId": "csv-load",
-                "hypothesisId": "A",
-                "location": f"{file_path}:load_csv",
-                "message": "Starting CSV load",
-                "data": {"file_path": str(file_path)},
-                "timestamp": int(__import__("time").time() * 1000)
-            }, f)
-            f.write("\n")
-    except: pass
-    # #endregion
-    
     try:
         logger.info(f"Loading CSV: {file_path}")
+        
+        # Check file size for chunked reading
+        file_size_mb = file_path.stat().st_size / (1024 * 1024)
+        use_chunking = chunk_size is not None or file_size_mb > 50
         
         # Detect file format by checking magic bytes (Excel files start with PK)
         is_excel = False
@@ -374,7 +402,6 @@ def load_csv(file_path: Path) -> Optional[pd.DataFrame]:
             with open(file_path, 'rb') as f:
                 header = f.read(4)
                 # Excel files (XLSX) are ZIP archives, start with PK\x03\x04
-                # XLS files start with different bytes
                 if header.startswith(b'PK\x03\x04') or file_path.suffix.lower() in ['.xlsx', '.xls']:
                     is_excel = True
         except Exception:
@@ -382,44 +409,10 @@ def load_csv(file_path: Path) -> Optional[pd.DataFrame]:
         
         # Handle Excel files
         if is_excel:
-            # #region agent log
-            try:
-                with open(log_path, "a", encoding="utf-8") as f:
-                    json.dump({
-                        "sessionId": "debug-session",
-                        "runId": "csv-load",
-                        "hypothesisId": "H",
-                        "location": f"{file_path}:load_csv",
-                        "message": "Detected Excel file, using read_excel",
-                        "data": {"file_path": str(file_path), "extension": file_path.suffix},
-                        "timestamp": int(__import__("time").time() * 1000)
-                    }, f)
-                    f.write("\n")
-            except: pass
-            # #endregion
-            
             try:
                 df = pd.read_excel(file_path, engine='openpyxl')
                 logger.info(f"Successfully loaded Excel file with openpyxl")
-                
-                # #region agent log
-                try:
-                    with open(log_path, "a", encoding="utf-8") as f:
-                        json.dump({
-                            "sessionId": "debug-session",
-                            "runId": "csv-load",
-                            "hypothesisId": "I",
-                            "location": f"{file_path}:load_csv",
-                            "message": "Excel file loaded successfully",
-                            "data": {"rows": len(df), "cols": len(df.columns)},
-                            "timestamp": int(__import__("time").time() * 1000)
-                        }, f)
-                        f.write("\n")
-                except: pass
-                # #endregion
-                
                 logger.info(f"Loaded {len(df):,} rows, {len(df.columns)} columns")
-                logger.info(f"Columns: {', '.join(df.columns[:10])}...")
                 return df
             except ImportError:
                 logger.warning("openpyxl not installed, trying xlrd")
@@ -435,165 +428,83 @@ def load_csv(file_path: Path) -> Optional[pd.DataFrame]:
                 logger.error(f"Error reading Excel file: {excel_error}")
                 return None
         
-        # Try different encodings for CSV files
-        encodings = ["utf-8", "latin-1", "iso-8859-1", "cp1252"]
-        df = None
-        last_error = None
+        # Detect encoding once (optimized)
+        encoding = detect_encoding(file_path)
         
-        for encoding in encodings:
+        # Load CSV with detected encoding
+        if use_chunking:
+            chunk_size = chunk_size or 50000
+            logger.info(f"Large file ({file_size_mb:.1f} MB), using chunked reading (chunk_size={chunk_size})...")
+            chunks = []
             try:
-                # #region agent log
-                try:
-                    with open(log_path, "a", encoding="utf-8") as f:
-                        json.dump({
-                            "sessionId": "debug-session",
-                            "runId": "csv-load",
-                            "hypothesisId": "B",
-                            "location": f"{file_path}:load_csv",
-                            "message": "Trying encoding",
-                            "data": {"encoding": encoding},
-                            "timestamp": int(__import__("time").time() * 1000)
-                        }, f)
-                        f.write("\n")
-                except: pass
-                # #endregion
-                
-                # Try C engine first (faster, better error messages)
+                for chunk in pd.read_csv(
+                    file_path,
+                    encoding=encoding,
+                    chunksize=chunk_size,
+                    low_memory=False,
+                    parse_dates=False,
+                    on_bad_lines='skip',
+                    engine='c',
+                ):
+                    chunks.append(chunk)
+                df = pd.concat(chunks, ignore_index=True)
+                logger.info(f"Successfully loaded CSV with encoding: {encoding} (chunked)")
+            except (UnicodeDecodeError, pd.errors.ParserError) as e:
+                logger.warning(f"Error with detected encoding {encoding}, retrying with Python engine...")
+                # Fallback to Python engine with error handling
+                chunks = []
+                for chunk in pd.read_csv(
+                    file_path,
+                    encoding=encoding,
+                    chunksize=chunk_size,
+                    parse_dates=False,
+                    on_bad_lines='skip',
+                    engine='python',
+                    sep=',',
+                    quotechar='"',
+                    skipinitialspace=True,
+                ):
+                    chunks.append(chunk)
+                df = pd.concat(chunks, ignore_index=True)
+                logger.info(f"Successfully loaded CSV with encoding: {encoding} (chunked, Python engine)")
+        else:
+            # Try C engine first (faster)
+            try:
+                df = pd.read_csv(
+                    file_path,
+                    encoding=encoding,
+                    low_memory=False,
+                    parse_dates=False,
+                    on_bad_lines='skip',
+                    engine='c',
+                )
+                logger.info(f"Successfully loaded CSV with encoding: {encoding}")
+            except (UnicodeDecodeError, pd.errors.ParserError) as e:
+                logger.warning(f"CSV parsing error with encoding {encoding}: {e}")
+                logger.info("Retrying with Python engine and error handling...")
+                # Retry with Python engine (more lenient)
                 try:
                     df = pd.read_csv(
                         file_path,
                         encoding=encoding,
-                        low_memory=False,
                         parse_dates=False,
                         on_bad_lines='skip',
-                        engine='c',  # C engine first
-                    )
-                    logger.info(f"Successfully loaded CSV with encoding: {encoding}")
-                    
-                    # #region agent log
-                    try:
-                        with open(log_path, "a", encoding="utf-8") as f:
-                            json.dump({
-                                "sessionId": "debug-session",
-                                "runId": "csv-load",
-                                "hypothesisId": "C",
-                                "location": f"{file_path}:load_csv",
-                                "message": "CSV loaded successfully",
-                                "data": {"encoding": encoding, "rows": len(df), "cols": len(df.columns)},
-                                "timestamp": int(__import__("time").time() * 1000)
-                            }, f)
-                            f.write("\n")
-                    except: pass
-                    # #endregion
-                    
-                    break
-                except UnicodeDecodeError:
-                    # Try next encoding
-                    continue
-            except UnicodeDecodeError as e:
-                last_error = e
-                continue
-            except pd.errors.ParserError as e:
-                # #region agent log
-                try:
-                    with open(log_path, "a", encoding="utf-8") as f:
-                        json.dump({
-                            "sessionId": "debug-session",
-                            "runId": "csv-load",
-                            "hypothesisId": "D",
-                            "location": f"{file_path}:load_csv",
-                            "message": "ParserError encountered",
-                            "data": {"encoding": encoding, "error": str(e)},
-                            "timestamp": int(__import__("time").time() * 1000)
-                        }, f)
-                        f.write("\n")
-                except: pass
-                # #endregion
-                
-                logger.warning(f"CSV parsing error with encoding {encoding}: {e}")
-                logger.info("Retrying with error handling options...")
-                
-                # Retry with Python engine (more lenient, but no low_memory option)
-                try:
-                    df = pd.read_csv(
-                        file_path,
-                        encoding=encoding,
-                        parse_dates=False,
-                        on_bad_lines='skip',  # Skip bad lines
-                        engine='python',  # Python engine - note: no low_memory option
-                        sep=',',  # Explicit separator
+                        engine='python',
+                        sep=',',
                         quotechar='"',
                         skipinitialspace=True,
                     )
-                    logger.info(f"Successfully loaded CSV with encoding: {encoding} (with error handling)")
-                    
-                    # #region agent log
-                    try:
-                        with open(log_path, "a", encoding="utf-8") as f:
-                            json.dump({
-                                "sessionId": "debug-session",
-                                "runId": "csv-load",
-                                "hypothesisId": "E",
-                                "location": f"{file_path}:load_csv",
-                                "message": "CSV loaded with error handling",
-                                "data": {"encoding": encoding, "rows": len(df), "cols": len(df.columns)},
-                                "timestamp": int(__import__("time").time() * 1000)
-                            }, f)
-                            f.write("\n")
-                    except: pass
-                    # #endregion
-                    
-                    break
+                    logger.info(f"Successfully loaded CSV with encoding: {encoding} (Python engine)")
                 except Exception as retry_error:
-                    logger.warning(f"Retry also failed: {retry_error}")
-                    last_error = retry_error
-                    continue
-        
-        if df is None:
-            logger.error(f"Failed to load CSV with any encoding. Last error: {last_error}")
-            
-            # #region agent log
-            try:
-                with open(log_path, "a", encoding="utf-8") as f:
-                    json.dump({
-                        "sessionId": "debug-session",
-                        "runId": "csv-load",
-                        "hypothesisId": "F",
-                        "location": f"{file_path}:load_csv",
-                        "message": "CSV load failed",
-                        "data": {"last_error": str(last_error)},
-                        "timestamp": int(__import__("time").time() * 1000)
-                    }, f)
-                    f.write("\n")
-            except: pass
-            # #endregion
-            
-            return None
+                    logger.error(f"Failed to load CSV: {retry_error}")
+                    return None
         
         logger.info(f"Loaded {len(df):,} rows, {len(df.columns)} columns")
         logger.info(f"Columns: {', '.join(df.columns[:10])}...")
-        
         return df
         
     except Exception as e:
         logger.error(f"Error loading CSV: {e}")
-        
-        # #region agent log
-        try:
-            with open(log_path, "a", encoding="utf-8") as f:
-                json.dump({
-                    "sessionId": "debug-session",
-                    "runId": "csv-load",
-                    "hypothesisId": "G",
-                    "location": f"{file_path}:load_csv",
-                    "message": "Unexpected error",
-                    "data": {"error": str(e), "error_type": type(e).__name__},
-                    "timestamp": int(__import__("time").time() * 1000)
-                }, f)
-                f.write("\n")
-        except: pass
-        # #endregion
-        
         return None
 
 
@@ -671,6 +582,229 @@ def check_file_ingested(file_name: str, engine) -> bool:
     except Exception as e:
         logger.warning(f"Error checking ingestion metadata: {e}")
         return False
+
+
+def discover_all_resources_parallel(datasets: list[str], max_workers: int = 5) -> Dict[str, Optional[str]]:
+    """
+    Discover all resource IDs in parallel before downloads.
+    
+    Args:
+        datasets: List of dataset keys to discover
+        max_workers: Maximum number of parallel discovery requests
+        
+    Returns:
+        Dict mapping dataset_key -> resource_id (or None if failed)
+    """
+    logger.info(f"Discovering resource IDs for {len(datasets)} datasets in parallel (max {max_workers} workers)...")
+    discovered = {}
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(discover_resource_id, dataset_key): dataset_key
+            for dataset_key in datasets
+        }
+        
+        for future in as_completed(futures):
+            dataset_key = futures[future]
+            try:
+                resource_id = future.result()
+                discovered[dataset_key] = resource_id
+                if resource_id:
+                    logger.info(f"✓ Discovered resource for {dataset_key}")
+                else:
+                    logger.warning(f"✗ Failed to discover resource for {dataset_key}")
+            except Exception as e:
+                logger.error(f"✗ Exception discovering {dataset_key}: {e}")
+                discovered[dataset_key] = None
+    
+    success_count = sum(1 for v in discovered.values() if v is not None)
+    logger.info(f"Resource discovery complete: {success_count}/{len(datasets)} succeeded")
+    return discovered
+
+
+def batch_record_ingestion_metadata(
+    files: Dict[str, Path],
+    engine,
+    dataset_types: Optional[Dict[str, str]] = None,
+) -> Dict[str, bool]:
+    """
+    Batch record ingestion metadata for multiple files in a single transaction.
+    
+    Args:
+        files: Dict mapping dataset_key -> file_path
+        engine: SQLAlchemy engine
+        dataset_types: Optional dict mapping dataset_key -> dataset_type
+        
+    Returns:
+        Dict mapping dataset_key -> success (bool)
+    """
+    if not engine:
+        return {key: True for key in files.keys()}
+    
+    results = {}
+    try:
+        with engine.begin() as conn:
+            for dataset_key, file_path in files.items():
+                file_name = file_path.name
+                dataset_type = (dataset_types or {}).get(dataset_key)
+                
+                try:
+                    # Check if already ingested and insert/update in one query
+                    result = conn.execute(
+                        text("""
+                            INSERT INTO ingestion_metadata 
+                            (file_name, record_count, status, ingested_at, dataset_type)
+                            VALUES (:file_name, 0, 'in_progress', CURRENT_TIMESTAMP, :dataset_type)
+                            ON CONFLICT (file_name) 
+                            DO UPDATE SET 
+                                status = 'in_progress',
+                                ingested_at = CURRENT_TIMESTAMP,
+                                dataset_type = COALESCE(:dataset_type, ingestion_metadata.dataset_type)
+                            RETURNING id
+                        """),
+                        {
+                            "file_name": file_name,
+                            "dataset_type": dataset_type,
+                        }
+                    )
+                    metadata_id = result.fetchone()[0]
+                    results[dataset_key] = True
+                    logger.debug(f"Recorded ingestion start for {file_name} (id: {metadata_id})")
+                except Exception as e:
+                    logger.error(f"Error recording ingestion start for {file_name}: {e}")
+                    results[dataset_key] = False
+        
+        logger.info(f"Batch recorded ingestion metadata for {sum(results.values())}/{len(files)} files")
+        return results
+    except Exception as e:
+        logger.error(f"Error in batch recording: {e}")
+        return {key: False for key in files.keys()}
+
+
+def batch_update_ingestion_complete(
+    files: Dict[str, Tuple[Path, int]],
+    engine,
+    dataset_types: Optional[Dict[str, str]] = None,
+) -> Dict[str, bool]:
+    """
+    Batch update ingestion completion for multiple files.
+    
+    Args:
+        files: Dict mapping dataset_key -> (file_path, record_count)
+        engine: SQLAlchemy engine
+        dataset_types: Optional dict mapping dataset_key -> dataset_type
+        
+    Returns:
+        Dict mapping dataset_key -> success (bool)
+    """
+    if not engine:
+        return {key: True for key in files.keys()}
+    
+    results = {}
+    try:
+        with engine.begin() as conn:
+            for dataset_key, (file_path, record_count) in files.items():
+                file_name = file_path.name
+                dataset_type = (dataset_types or {}).get(dataset_key)
+                
+                try:
+                    conn.execute(
+                        text("""
+                            UPDATE ingestion_metadata
+                            SET 
+                                record_count = :record_count,
+                                status = 'completed',
+                                error_message = NULL,
+                                dataset_type = COALESCE(:dataset_type, dataset_type)
+                            WHERE file_name = :file_name
+                        """),
+                        {
+                            "file_name": file_name,
+                            "record_count": record_count,
+                            "dataset_type": dataset_type,
+                        }
+                    )
+                    results[dataset_key] = True
+                except Exception as e:
+                    logger.error(f"Error updating completion for {file_name}: {e}")
+                    results[dataset_key] = False
+        
+        logger.info(f"Batch updated completion for {sum(results.values())}/{len(files)} files")
+        return results
+    except Exception as e:
+        logger.error(f"Error in batch update: {e}")
+        return {key: False for key in files.keys()}
+
+
+def process_all_files_parallel(
+    downloaded: Dict[str, Path],
+    engine: Optional[Any],
+    dataset_types: Optional[Dict[str, str]] = None,
+    max_workers: int = 4,
+) -> Dict[str, bool]:
+    """
+    Process downloaded files in parallel.
+    
+    Args:
+        downloaded: Dict mapping dataset_key -> file_path
+        engine: Database engine (optional)
+        dataset_types: Optional dict mapping dataset_key -> dataset_type
+        max_workers: Maximum number of parallel processing workers
+        
+    Returns:
+        Dict mapping dataset_key -> success (bool)
+    """
+    logger.info(f"Processing {len(downloaded)} files in parallel (max {max_workers} workers)...")
+    
+    # Batch record ingestion start
+    if engine:
+        batch_record_ingestion_metadata(downloaded, engine, dataset_types)
+    
+    results = {}
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                process_single_file,
+                file_path,
+                dataset_type=(dataset_types or {}).get(dataset_key),
+                engine=None,  # Don't pass engine to avoid duplicate DB calls
+            ): dataset_key
+            for dataset_key, file_path in downloaded.items()
+        }
+        
+        for future in as_completed(futures):
+            dataset_key = futures[future]
+            try:
+                success = future.result()
+                results[dataset_key] = success
+                if success:
+                    logger.success(f"✓ Successfully processed {dataset_key}")
+                else:
+                    logger.error(f"✗ Failed to process {dataset_key}")
+            except Exception as e:
+                logger.error(f"✗ Exception processing {dataset_key}: {e}")
+                results[dataset_key] = False
+    
+    # Batch update completion with record counts
+    if engine:
+        file_records = {}
+        for dataset_key, file_path in downloaded.items():
+            if results.get(dataset_key, False):
+                try:
+                    df = load_csv(file_path)
+                    record_count = len(df) if df is not None else 0
+                    file_records[dataset_key] = (file_path, record_count)
+                except Exception as e:
+                    logger.warning(f"Could not get record count for {dataset_key}: {e}")
+                    file_records[dataset_key] = (file_path, 0)
+        
+        if file_records:
+            batch_update_ingestion_complete(file_records, engine, dataset_types)
+    
+    success_count = sum(1 for v in results.values() if v)
+    logger.info(f"Processing complete: {success_count}/{len(downloaded)} files succeeded")
+    return results
 
 
 def download_all_datasets_parallel(
@@ -974,6 +1108,21 @@ def main(
     if all_datasets:
         logger.info("Downloading all configured datasets in parallel...")
         all_dataset_keys = get_all_dataset_keys()
+        
+        # Discover all resource IDs in parallel first (optimization)
+        logger.info("Step 1: Discovering resource IDs...")
+        discovered = discover_all_resources_parallel(all_dataset_keys, max_workers=max_workers)
+        
+        # Update TORONTO_DATASETS with discovered resource IDs
+        for dataset_key, resource_id in discovered.items():
+            if resource_id:
+                if resource_id.startswith("http"):
+                    TORONTO_DATASETS[dataset_key]["direct_url"] = resource_id
+                else:
+                    TORONTO_DATASETS[dataset_key]["resource_id"] = resource_id
+        
+        # Download all datasets in parallel
+        logger.info("Step 2: Downloading datasets...")
         downloaded = download_all_datasets_parallel(
             all_dataset_keys,
             data_dir,
@@ -981,17 +1130,17 @@ def main(
             skip_existing=skip_download,
         )
         
-        # Process each downloaded file
-        success_count = 0
-        for dataset_key, file_path in downloaded.items():
-            logger.info("")
-            logger.info("=" * 60)
-            logger.info(f"Processing {TORONTO_DATASETS[dataset_key]['name']}")
-            logger.info("=" * 60)
-            
-            if process_single_file(file_path, dataset_type=dataset_key, engine=engine):
-                success_count += 1
+        # Process all downloaded files in parallel (optimization)
+        logger.info("Step 3: Processing downloaded files...")
+        dataset_types = {key: key for key in downloaded.keys()}
+        results = process_all_files_parallel(
+            downloaded,
+            engine,
+            dataset_types=dataset_types,
+            max_workers=max_workers,
+        )
         
+        success_count = sum(1 for v in results.values() if v)
         logger.info("")
         logger.info("=" * 60)
         logger.info(f"Bronze layer complete! Processed {success_count}/{len(downloaded)} files")
